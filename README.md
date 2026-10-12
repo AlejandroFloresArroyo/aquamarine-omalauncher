@@ -163,8 +163,9 @@ Qué hace el workflow (`ubuntu-24.04-arm` con el contenedor `menci/archlinuxarm:
 2. Clona aquamarine en `v0.15.1` y **falla** si el tag no apunta exactamente a
    `f31c47a1b9d300847d8fc3108ad959448103dfc1`.
 3. Aplica el parche (`git apply --check` y luego `git apply`).
-4. `cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/aquamarine-shm`, compila e
-   instala en un directorio de staging.
+4. `cmake -DCMAKE_BUILD_TYPE=None -DCMAKE_INSTALL_PREFIX=/opt/aquamarine-shm` con los flags de
+   `/etc/makepkg.conf`, como el paquete de Arch (sin `-Wl,--as-needed` aparecería
+   `libGLESv2.so.2` en `NEEDED`), compila e instala en un directorio de staging.
 5. Comprueba la librería y **falla** si:
    - el soname no es `libaquamarine.so.14`;
    - sus `NEEDED` no son exactamente los del `libaquamarine.so.14` de serie del teléfono (por
