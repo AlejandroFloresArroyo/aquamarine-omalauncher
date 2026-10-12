@@ -403,9 +403,10 @@ pendiente. El test detecta las 11.
 
 ## Limitaciones conocidas
 
-- **No hay touch.** El backend Wayland de aquamarine nunca pide `wl_touch` (`Wayland.cpp:347-364`),
-  así que el táctil del teléfono no llega a Hyprland. Hacen falta teclado y ratón. Arreglarlo
-  requiere otro parche: un `CWaylandTouch` que emita eventos `ITouch`.
+- **Táctil como ratón.** El backend Wayland de aquamarine nunca pide `wl_touch`
+  (`Wayland.cpp:347-364`). El compositor de omalauncher emula el puntero para los clientes que no
+  lo piden (`Input.kt`, `wantsTouch`), así que tocar funciona como mover y hacer clic. Gestos
+  táctiles reales necesitarían otro parche (un `CWaylandTouch` que emita eventos `ITouch`).
 - **Coste de CPU.** La copia GPU→CPU corre en el hilo principal de Hyprland (ya no la espera a la
   GPU).
   - Un frame completo de 2304x1440 cuesta unos 4,7 ms en un A720 y entre 86 y 135 ms en un A520.
@@ -418,9 +419,8 @@ pendiente. El test detecta las 11.
 - **Primer modeset y cambios de tamaño.** Hyprland hace commit con un buffer aún sin renderizar.
   Si el host ya configuró la superficie, se ve un frame negro o basura hasta el primer frame real;
   el camino dmabuf original hace lo mismo.
-- **Plataforma EGL.** Hyprland preferirá probablemente `EGL_PLATFORM_DEVICE_EXT`: en el /sys falso,
-  `card0` y `renderD128` cuelgan del mismo dispositivo PCI. Solo se ha verificado la plataforma
-  GBM con zink.
+- **Plataforma EGL.** Hyprland usa `EGL_PLATFORM_DEVICE_EXT` (en el /sys falso, `card0` y
+  `renderD128` cuelgan del mismo dispositivo PCI) y funciona con zink: verificado en la tableta.
 - **Fences.** La seguridad de los fences por frame depende de que zink→radv-xclipse nunca exporte
   un sync_file desde un syncobj sin materializar. Esa protección está en el driver, no aquí. Si el
   driver devolviera un fence ya señalado sin que la GPU haya terminado, el último frame de un
@@ -436,7 +436,29 @@ pendiente. El test detecta las 11.
 
 ## Qué está verificado y qué no
 
-Verificado en local, sin GPU ni Wayland:
+Verificado en la tableta (12-10-2026; Xclipse 540, radv-xclipse-540 + zink de Mesa 26.2.4, Hyprland
+0.56.2 anidado en el sway del usuario, salida de 758x1247). El arnés está en `/root/src/hypr-test`
+(`run-hypr.sh sway 120 check`):
+- Hyprland arranca con la plataforma EGL device y `Renderer: zink Vulkan 1.4(AMD Radeon Graphics
+  (RADV TITAN))`. Todos los cuadros llegan con fence explícito y, cuando aquamarine lo mira, la GPU
+  ya terminó (de commit a copia: ~0 ms de media).
+- Lo que dibuja la GPU es lo que muestra sway. Con la pantalla quieta, la captura de Hyprland y la
+  de sway son idénticas salvo ±1 de redondeo en el borde de las ventanas. Con contenido en
+  movimiento coinciden en 95-98 %; la diferencia es el reloj que avanza entre una captura y otra.
+- Velocidad con lectura por mmap (0005):
+  - ~73-82 cuadros/s con cambios chicos y ~43-51 con una terminal escupiendo texto.
+  - Apps con GPU dentro de Hyprland: vkcube ~63 y es2gears (zink) ~29.
+  - Mapear cuesta 0.4-0.7 ms por cuadro (con `gbm_bo_map`, 3.7-5.7 ms) y copiar 0.2-0.9 ms para
+    0.1-0.4 Mpx. Nunca hizo falta esperar a que el host soltara un buffer.
+- La GPU no se reinició en ninguna prueba (`VRAM_LOST_COUNTER` siempre 0).
+- La capa de Omarchy (sesión 00d52b64) corre encima con el perfil gpu: barra y menú dibujados por la
+  GPU. Para eso las apps de dentro de Hyprland necesitan `MESA_LOADER_DRIVER_OVERRIDE=zink`; con
+  solo `GALLIUM_DRIVER=zink` las superficies de Qt quedan en blanco.
+
+Pendiente: Hyprland directamente sobre el compositor de omalauncher (wayland-0) a pantalla
+completa, donde copiar un cuadro entero cuesta más.
+
+Verificado en local antes de la primera prueba, sin GPU ni Wayland:
 - El parche aplica con `git apply --check` sobre una copia limpia de v0.15.1 (f31c47a).
 - Con las cabeceras reales de protocolo (hyprwayland-scanner 0.4.6, el paquete firmado de Arch
   Linux ARM extraído en un directorio temporal, sin instalar nada), compila **toda** la librería
@@ -450,9 +472,5 @@ Verificado en local, sin GPU ni Wayland:
   NEEDED y versiones de símbolos, y falla si cambia un NEEDED o si el objetivo tiene un glibc,
   GLIBCXX o CXXABI más viejo.
 
-No verificado:
-- Un build real con CMake en CI.
-- Cualquier ejecución contra el host, la GPU o Hyprland (por las reglas de esta tarea no se
-  ejecutó nada de eso): que el host conteste frame callbacks como se espera, que el epoll con el
-  sync_file despierte a Hyprland en este kernel, la plataforma EGL que elija Hyprland, y la lectura
-  con `AQ_WAYLAND_SHM_MMAP=1` en sgpu.
+El build en GitHub Actions corre en cada push y verifica soname, `NEEDED`, versiones de símbolos y
+los tests (también el de hyprgraphics).
