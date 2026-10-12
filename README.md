@@ -15,6 +15,7 @@ se carga con `LD_LIBRARY_PATH`. Hyprland no se toca.
 patches/0001-wayland-wl_shm-presentation-fallback.patch   presentar por wl_shm (el parche principal)
 patches/0002-wayland-bind-globals-at-advertised-version.patch   no pedir versiones de protocolo que el host no ofrece
 patches/0003-wayland-replay-configure-before-announce.patch      no perder el tamaño que el host manda al arrancar
+patches/0004-wayland-shm-presentation-stats.patch               tiempos de presentación con AQ_WAYLAND_SHM_STATS=1
                                                             (se aplican en orden con git apply en la raíz de aquamarine v0.15.1)
 .github/workflows/build.yml                                 build en GitHub Actions (Arch Linux ARM, aarch64)
 tests/shm_copy_test.cpp                                     test de CPU de la lógica de copia, del bookkeeping y del bucle de frames
@@ -335,6 +336,7 @@ lo quita (bajo tu responsabilidad).
 | `AQ_WAYLAND_SHM_MMAP` | sin definir / `1` | Sin definir: lee con `gbm_bo_map` (verificado). `1`: `mmap` directo del dmabuf entre `DMA_BUF_IOCTL_SYNC`. |
 | `AQ_WAYLAND_SHM_DMABUF_SYNC` | sin definir / `1` / `0` | `DMA_BUF_IOCTL_SYNC` alrededor de la lectura. Sin definir: en frames sin fence, en las re-copias y con `AQ_WAYLAND_SHM_MMAP=1`. `1`: siempre. `0`: nunca. |
 | `AQ_WAYLAND_SHM_RECOPY` | sin definir / `1` / `0` | Re-copia a los 25 ms. Sin definir: solo de frames sin fence. `1`: de todos (útil si el último frame de un cambio a veces queda viejo). `0`: nunca. |
+| `AQ_WAYLAND_SHM_STATS` | sin definir / `1` | `1`: cada 5 s registra (nivel debug) cuántos cuadros se presentaron, cuánto esperaron a la GPU, cuánto tardaron el mapeo y la copia y cuántos píxeles se copiaron. |
 
 ## Tests
 
