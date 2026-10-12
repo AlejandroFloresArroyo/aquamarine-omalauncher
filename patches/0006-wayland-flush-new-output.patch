@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AlejandroFloresArroyo
+ <26047316+AlejandroFloresArroyo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 02:16:17 -0600
+Subject: [PATCH] wayland: flush the requests of a new output right away
+
+createOutput() queues get_xdg_surface, get_toplevel and the initial
+commit, but nothing flushed them: they went out with the next
+dispatchEvents(), which only runs once the host has sent something. A host
+with nothing pending (for example a headless parent without seat devices)
+then never configures the toplevel, the output is never announced and the
+consumer falls back to its headless output. Found by testing against a
+headless sway parent.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/backend/Wayland.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/backend/Wayland.cpp b/src/backend/Wayland.cpp
+index b14096b..0710dba 100644
+--- a/src/backend/Wayland.cpp
++++ b/src/backend/Wayland.cpp
+@@ -218,6 +218,11 @@ bool Aquamarine::CWaylandBackend::createOutput(const std::string& szName) {
+         backend->events.newOutput.emit(SP<IOutput>(o));
+         o->announce();
+     });
++
++    // Send the new toplevel's requests now. They would otherwise wait for the next dispatchEvents(),
++    // which only runs once the host has sent something: a host that says nothing until it gets them
++    // (e.g. no seat events pending) never configures the output, and it is never announced.
++    wl_display_flush(waylandState.display);
+     return true;
+ }
+ 

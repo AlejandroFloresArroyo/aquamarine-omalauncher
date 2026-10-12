@@ -17,6 +17,7 @@ patches/0002-wayland-bind-globals-at-advertised-version.patch   no pedir version
 patches/0003-wayland-replay-configure-before-announce.patch      no perder el tamaño que el host manda al arrancar
 patches/0004-wayland-shm-presentation-stats.patch               tiempos de presentación con AQ_WAYLAND_SHM_STATS=1
 patches/0005-wayland-shm-mmap-by-default.patch                  leer los cuadros con mmap del dmabuf (10x más rápido)
+patches/0006-wayland-flush-new-output.patch                     mandar enseguida los pedidos de una salida nueva
                                                             (se aplican en orden con git apply en la raíz de aquamarine v0.15.1)
 .github/workflows/build.yml                                 build en GitHub Actions (Arch Linux ARM, aarch64)
 tests/shm_copy_test.cpp                                     test de CPU de la lógica de copia, del bookkeeping y del bucle de frames
