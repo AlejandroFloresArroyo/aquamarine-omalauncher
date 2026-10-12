@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AlejandroFloresArroyo
+ <26047316+AlejandroFloresArroyo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 02:27:25 -0600
+Subject: [PATCH] asyncResourceGatherer: don't lose the wakeup of a resource
+ finished before await()
+
+await() created awaitingCv and then waited for awaitingEvent, but the
+gather thread only set awaitingEvent (without holding awaitingMtx) when
+awaitingCv already existed. When the gather thread rendered the resource
+before the caller reached await(), which is a plain race since callers
+enqueue() and await() back to back, awaitingEvent was never set and
+await() blocked forever.
+
+Hyprland 0.56.2 hit this in IHyprRenderer::renderText() from the debug
+overlay: the main thread sat in await() while the gather thread waited
+for new work. renderText() is also used for notifications, the error
+bar, group bar titles and the lock screen text.
+
+Set awaitingEvent always, under awaitingMtx, and notify under it; in
+await(), check it under the same mutex before creating the condition
+variable and waiting.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/resource/AsyncResourceGatherer.cpp | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/src/resource/AsyncResourceGatherer.cpp b/src/resource/AsyncResourceGatherer.cpp
+index 7e3e7de..0472b62 100644
+--- a/src/resource/AsyncResourceGatherer.cpp
++++ b/src/resource/AsyncResourceGatherer.cpp
+@@ -30,8 +30,14 @@ void CAsyncResourceGatherer::enqueue(Hyprutils::Memory::CAtomicSharedPointer<IAs
+ }
+ 
+ void CAsyncResourceGatherer::await(Hyprutils::Memory::CAtomicSharedPointer<IAsyncResource> resource) {
+-    resource->m_impl->awaitingCv = Hyprutils::Memory::makeUnique<std::condition_variable>();
+     std::unique_lock<std::mutex> lk(resource->m_impl->awaitingMtx);
++
++    // The gather thread may have rendered the resource already (it sets awaitingEvent under this mutex
++    // whether or not anybody waits): then there is nothing to wait for.
++    if (resource->m_impl->awaitingEvent)
++        return;
++
++    resource->m_impl->awaitingCv = Hyprutils::Memory::makeUnique<std::condition_variable>();
+     resource->m_impl->awaitingCv->wait(lk, [&resource] { return resource->m_impl->awaitingEvent; });
+     resource->m_impl->awaitingCv.reset();
+ }
+@@ -64,9 +70,15 @@ void CAsyncResourceGatherer::asyncAssetSpinLock() {
+         for (auto& r : requests) {
+             r->render();
+ 
+-            if (r->m_impl->awaitingCv) {
++            {
++                // Under the mutex await() holds while it checks and waits: a waiter either finds
++                // awaitingEvent set or is already waiting on awaitingCv and gets notified. Setting it
++                // only when awaitingCv existed lost the wakeup of a resource that finished before
++                // await() ran, and await() then blocked forever.
++                std::lock_guard<std::mutex> lg(r->m_impl->awaitingMtx);
+                 r->m_impl->awaitingEvent = true;
+-                r->m_impl->awaitingCv->notify_all();
++                if (r->m_impl->awaitingCv)
++                    r->m_impl->awaitingCv->notify_all();
+             }
+             r->m_ready = true;
+             r->m_events.finished.emit();

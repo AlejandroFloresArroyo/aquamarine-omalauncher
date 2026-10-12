@@ -26,6 +26,15 @@ env:
   TARGET_GLIBC_MAX: "2.43"
   TARGET_GLIBCXX_MAX: "3.4.35"
   TARGET_CXXABI_MAX: "1.3.17"
+  # hyprgraphics 0.5.1 (libhyprgraphics.so.4, what Hyprland 0.56.2 links) with hyprgraphics/patches
+  HG_REPO: https://github.com/hyprwm/hyprgraphics
+  HG_TAG: v0.5.1
+  HG_COMMIT: 482d4b7ec36ffdaf3573086aa586b178fd5404be
+  # NEEDED of the stock /usr/lib/libhyprgraphics.so.0.5.1 (hyprgraphics 0.5.1-4) on the target
+  HG_EXPECTED_NEEDED: >-
+    libhyprutils.so.13 libjpeg.so.8 libwebp.so.7 libmagic.so.1 librsvg-2.so.2 libpangocairo-1.0.so.0
+    libpango-1.0.so.0 libcairo.so.2 libpng16.so.16 libgobject-2.0.so.0 libglib-2.0.so.0 libjxl.so.0.12
+    libjxl_threads.so.0.12 libstdc++.so.6 libm.so.6 libgcc_s.so.1 libc.so.6 ld-linux-aarch64.so.1
 
 jobs:
   build:
@@ -57,7 +66,8 @@ jobs:
             wayland wayland-protocols \
             libglvnd mesa libdrm \
             seatd libinput systemd-libs \
-            pixman libdisplay-info hwdata
+            pixman libdisplay-info hwdata \
+            cairo file libjpeg-turbo libjxl libpng librsvg libwebp pango
           pacman -Q glibc gcc cmake hyprwayland-scanner hyprutils wayland wayland-protocols libglvnd mesa libdrm seatd libinput systemd-libs pixman libdisplay-info hwdata
 
       - name: Check out this repository (patch, tests)
@@ -159,16 +169,67 @@ jobs:
             aquamarine-shm/tests/shm_copy_test.cpp -lhyprutils -lpixman-1 -o build/shm_copy_test
           ./build/shm_copy_test
 
+      - name: Build hyprgraphics ${{ env.HG_TAG }} with hyprgraphics/patches
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "$HG_TAG" "$HG_REPO" hyprgraphics
+          test "$(git -C hyprgraphics rev-parse HEAD)" = "$HG_COMMIT"
+          for PATCH in "$GITHUB_WORKSPACE"/aquamarine-shm/hyprgraphics/patches/[0-9][0-9][0-9][0-9]-*.patch; do
+            sha256sum "$PATCH"
+            git -C hyprgraphics apply --check --verbose "$PATCH"
+            git -C hyprgraphics apply "$PATCH"
+          done
+          set +ux
+          source /etc/makepkg.conf
+          set -ux
+          export CFLAGS CXXFLAGS LDFLAGS
+          cmake -S hyprgraphics -B build-hg -DCMAKE_BUILD_TYPE=None -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib
+          cmake --build build-hg -j"$(nproc)"
+          DESTDIR="$GITHUB_WORKSPACE/stage" cmake --install build-hg
+
+      - name: Check libhyprgraphics and run the await regression test
+        run: |
+          set -euo pipefail
+          LIB="stage$PREFIX/lib/libhyprgraphics.so.4"
+          test -e "$LIB"
+          SONAME=$(readelf -d "$LIB" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')
+          test "$SONAME" = "libhyprgraphics.so.4" || { echo "::error::unexpected soname $SONAME"; exit 1; }
+          NEEDED=$(readelf -d "$LIB" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | sort | tr '\n' ' ')
+          WANT=$(echo $HG_EXPECTED_NEEDED | tr ' ' '\n' | sort | tr '\n' ' ')
+          echo "NEEDED: $NEEDED"
+          if [ "$NEEDED" != "$WANT" ]; then
+            echo "::error::libhyprgraphics NEEDED differs from the stock one on the target (expected: $WANT)"
+            exit 1
+          fi
+          GLIBC=$(objdump -T "$LIB" | { grep -o 'GLIBC_[0-9][0-9.]*' || true; } | sed 's/^GLIBC_//' | sort -uV | tail -1)
+          GLIBCXX=$(objdump -T "$LIB" | { grep -o 'GLIBCXX_[0-9][0-9.]*' || true; } | sed 's/^GLIBCXX_//' | sort -uV | tail -1)
+          for pair in "GLIBC $GLIBC $TARGET_GLIBC_MAX" "GLIBCXX $GLIBCXX $TARGET_GLIBCXX_MAX"; do
+            set -- $pair
+            if [ -n "${2:-}" ] && [ "$(printf '%s\n%s\n' "$2" "$3" | sort -V | tail -1)" != "$3" ]; then
+              echo "::error::libhyprgraphics needs $1_$2, the target only has up to $1_$3"
+              exit 1
+            fi
+          done
+          # Deterministic regression test: the stock library hangs here on the first await()
+          g++ -std=c++23 -O1 -I "stage$PREFIX/include" $(pkg-config --cflags cairo pixman-1) \
+            aquamarine-shm/hyprgraphics/tests/await_finished.cpp -L "stage$PREFIX/lib" -lhyprgraphics -lhyprutils \
+            -o build-hg/await_finished
+          LD_LIBRARY_PATH="stage$PREFIX/lib" timeout 60 ./build-hg/await_finished
+          echo "::notice::libhyprgraphics.so.4 ok: NEEDED as on the target, await regression test passes"
+
       - name: Package
         run: |
           set -euxo pipefail
           OUT=aquamarine-shm-0.15.1-aarch64
           # BSD-3-Clause: binary redistributions carry the notices
           install -Dm644 aquamarine/LICENSE "stage$PREFIX/share/licenses/aquamarine/LICENSE"
+          install -Dm644 hyprgraphics/LICENSE "stage$PREFIX/share/licenses/hyprgraphics/LICENSE"
           install -Dm644 aquamarine-shm/LICENSE "stage$PREFIX/share/licenses/aquamarine-omalauncher/LICENSE"
           {
             echo "aquamarine $AQ_TAG ($(git -C aquamarine rev-parse HEAD)) + the patches below"
-            echo "drop-in for: hyprland 0.56.2 + aquamarine 0.15.1 (libaquamarine.so.14) + hyprutils with libhyprutils.so.13"
+            echo "drop-in for: hyprland 0.56.2 + aquamarine 0.15.1 (libaquamarine.so.14) + hyprgraphics 0.5.1 (libhyprgraphics.so.4) + hyprutils with libhyprutils.so.13"
+            echo "hyprgraphics $HG_TAG ($(git -C hyprgraphics rev-parse HEAD)) + hyprgraphics/patches:"
+            (cd aquamarine-shm/hyprgraphics/patches && sha256sum [0-9][0-9][0-9][0-9]-*.patch | sed 's/^/  /')
             echo "patches (sha256):"
             (cd aquamarine-shm/patches && sha256sum [0-9][0-9][0-9][0-9]-*.patch | sed 's/^/  /')
             echo "built by: $GITHUB_REPOSITORY@$GITHUB_SHA, run $GITHUB_RUN_ID"

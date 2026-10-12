@@ -18,10 +18,24 @@ patches/0003-wayland-replay-configure-before-announce.patch      no perder el ta
 patches/0004-wayland-shm-presentation-stats.patch               tiempos de presentación con AQ_WAYLAND_SHM_STATS=1
 patches/0005-wayland-shm-mmap-by-default.patch                  leer los cuadros con mmap del dmabuf (10x más rápido)
 patches/0006-wayland-flush-new-output.patch                     mandar enseguida los pedidos de una salida nueva
+hyprgraphics/patches/0001-asyncresourcegatherer-await-lost-wakeup.patch
+                                                            hyprgraphics 0.5.1: await() se colgaba para siempre
+hyprgraphics/tests/await_finished.cpp                       test determinista de ese cuelgue
                                                             (se aplican en orden con git apply en la raíz de aquamarine v0.15.1)
 .github/workflows/build.yml                                 build en GitHub Actions (Arch Linux ARM, aarch64)
 tests/shm_copy_test.cpp                                     test de CPU de la lógica de copia, del bookkeeping y del bucle de frames
 ```
+
+## También: hyprgraphics 0.5.1 corregido
+
+El artefacto incluye además un `libhyprgraphics.so.4` (hyprgraphics 0.5.1, lo que enlaza Hyprland
+0.56.2) con una corrección: `CAsyncResourceGatherer::await()` perdía el aviso de un recurso que el
+hilo de fondo terminaba antes de que se llamara a `await()`, y entonces esperaba para siempre.
+Hyprland lo usa en `renderText()` (notificaciones, barra de errores, títulos de grupos, panel de
+depuración, texto de bloqueo), así que Hyprland podía congelarse de vez en cuando. En la tableta
+pasó con el panel `debug:overlay`. `hyprgraphics/tests/await_finished.cpp` lo reproduce siempre con
+la librería de serie y pasa con la corregida; el CI lo ejecuta. Se carga igual que aquamarine, con
+`LD_LIBRARY_PATH=/opt/aquamarine-shm/lib`.
 
 ## El problema
 
