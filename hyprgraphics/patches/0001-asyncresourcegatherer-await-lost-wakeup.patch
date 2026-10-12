@@ -2,35 +2,67 @@ From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: AlejandroFloresArroyo
  <26047316+AlejandroFloresArroyo@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 02:27:25 -0600
-Subject: [PATCH] asyncResourceGatherer: don't lose the wakeup of a resource
- finished before await()
+Subject: [PATCH] asyncResourceGatherer: fix two lost wakeups (await() could
+ block forever)
 
-await() created awaitingCv and then waited for awaitingEvent, but the
-gather thread only set awaitingEvent (without holding awaitingMtx) when
-awaitingCv already existed. When the gather thread rendered the resource
-before the caller reached await(), which is a plain race since callers
-enqueue() and await() back to back, awaitingEvent was never set and
-await() blocked forever.
+1. await() created awaitingCv and then waited for awaitingEvent, but the
+   gather thread only set awaitingEvent (without holding awaitingMtx) when
+   awaitingCv already existed. When the gather thread rendered the resource
+   before the caller reached await(), which is a plain race since callers
+   enqueue() and await() back to back, awaitingEvent was never set and
+   await() blocked forever. Now awaitingEvent is always set and notified
+   under awaitingMtx, and await() checks it under the same mutex before
+   creating the condition variable and waiting.
 
-Hyprland 0.56.2 hit this in IHyprRenderer::renderText() from the debug
-overlay: the main thread sat in await() while the gather thread waited
-for new work. renderText() is also used for notifications, the error
-bar, group bar titles and the lock screen text.
+2. wakeUpMainThread() set needsToProcess and notified without holding
+   requestMutex, so the notification could fall between the gather
+   thread's predicate check and its wait; the gather thread then slept for
+   its 5 s wait_for timeout with the caller of await() blocked behind it.
+   needsToProcess and exit are now written under requestMutex, and exit is
+   only read under it.
 
-Set awaitingEvent always, under awaitingMtx, and notify under it; in
-await(), check it under the same mutex before creating the condition
-variable and waiting.
+Hyprland 0.56.2 hit the first one in IHyprRenderer::renderText() from the
+debug overlay: the main thread sat in await() while the gather thread
+waited for new work. renderText() is also used for notifications, the
+error bar, group bar titles and the lock screen text.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/resource/AsyncResourceGatherer.cpp | 18 +++++++++++++++---
- 1 file changed, 15 insertions(+), 3 deletions(-)
+ src/resource/AsyncResourceGatherer.cpp | 33 +++++++++++++++++++++-----
+ 1 file changed, 27 insertions(+), 6 deletions(-)
 
 diff --git a/src/resource/AsyncResourceGatherer.cpp b/src/resource/AsyncResourceGatherer.cpp
-index 7e3e7de..0472b62 100644
+index 7e3e7de..3512493 100644
 --- a/src/resource/AsyncResourceGatherer.cpp
 +++ b/src/resource/AsyncResourceGatherer.cpp
-@@ -30,8 +30,14 @@ void CAsyncResourceGatherer::enqueue(Hyprutils::Memory::CAtomicSharedPointer<IAs
+@@ -8,7 +8,10 @@ CAsyncResourceGatherer::CAsyncResourceGatherer() {
+ }
+ 
+ CAsyncResourceGatherer::~CAsyncResourceGatherer() {
+-    m_asyncLoopState.exit = true;
++    {
++        std::lock_guard<std::mutex> lg(m_asyncLoopState.requestMutex);
++        m_asyncLoopState.exit = true;
++    }
+     wakeUpMainThread();
+ 
+     if (m_gatherThread.joinable())
+@@ -16,7 +19,13 @@ CAsyncResourceGatherer::~CAsyncResourceGatherer() {
+ }
+ 
+ void CAsyncResourceGatherer::wakeUpMainThread() {
+-    m_asyncLoopState.needsToProcess = true;
++    {
++        // Under requestMutex: the gather thread checks needsToProcess under it before it blocks, so the
++        // notification can't fall between that check and the wait (which then slept up to 5 s, with
++        // the caller of await() blocked behind it).
++        std::lock_guard<std::mutex> lg(m_asyncLoopState.requestMutex);
++        m_asyncLoopState.needsToProcess = true;
++    }
+     m_asyncLoopState.requestsCV.notify_all();
+ }
+ 
+@@ -30,14 +39,20 @@ void CAsyncResourceGatherer::enqueue(Hyprutils::Memory::CAtomicSharedPointer<IAs
  }
  
  void CAsyncResourceGatherer::await(Hyprutils::Memory::CAtomicSharedPointer<IAsyncResource> resource) {
@@ -46,7 +78,14 @@ index 7e3e7de..0472b62 100644
      resource->m_impl->awaitingCv->wait(lk, [&resource] { return resource->m_impl->awaitingEvent; });
      resource->m_impl->awaitingCv.reset();
  }
-@@ -64,9 +70,15 @@ void CAsyncResourceGatherer::asyncAssetSpinLock() {
+ 
+ void CAsyncResourceGatherer::asyncAssetSpinLock() {
+-    while (!m_asyncLoopState.exit) {
++    while (true) { // exit is read under requestMutex below
+ 
+         std::unique_lock lk(m_asyncLoopState.requestMutex);
+         if (!m_asyncLoopState.needsToProcess) // avoid a lock if a thread managed to request something already since we .unlock()ed
+@@ -64,9 +79,15 @@ void CAsyncResourceGatherer::asyncAssetSpinLock() {
          for (auto& r : requests) {
              r->render();
  
