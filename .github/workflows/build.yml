@@ -88,8 +88,14 @@ jobs:
       - name: Configure
         run: |
           set -euxo pipefail
+          # Build like Arch's aquamarine package: makepkg's flags (among them -Wl,--as-needed, without
+          # which libGLESv2.so.2 ends up in NEEDED) and build type None (asserts stay on, as in stock).
+          set +ux
+          source /etc/makepkg.conf
+          set -ux
+          export CFLAGS CXXFLAGS LDFLAGS
           cmake -S aquamarine -B build \
-            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_TYPE=None \
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_INSTALL_LIBDIR=lib
 
