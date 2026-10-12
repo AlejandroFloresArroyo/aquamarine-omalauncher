@@ -1,0 +1,259 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AlejandroFloresArroyo
+ <26047316+AlejandroFloresArroyo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 03:40:36 -0600
+Subject: [PATCH] wayland: apply configures after the ack, keep a mode for the
+ host size, version guards
+
+From a review of 0002/0003 (findings confirmed against the code and logs):
+
+- The size of an xdg_toplevel.configure is applied in xdg_surface.configure,
+  after the ack, in both modes (the wl_shm path already did): a consumer
+  that renders on the state event no longer attaches a buffer to an
+  unconfigured xdg_surface, also when the two events arrive in different
+  reads before the output is announced.
+- A 0x0 configure (the host lets us choose) is no longer replayed as
+  aquamarine's made-up 1280x720 after newOutput: as a state event it
+  overrode the consumer's explicit monitor rule (seen with Hyprland and a
+  rule pinning WAYLAND-1). Instead the output now always has one preferred
+  mode, the size of the window the host gives us (or the default), so a
+  "preferred" monitor rule resolves to it, also when the consumer re-applies
+  its rules later.
+- Requests newer than the bound version are only sent when it allows them:
+  damage_buffer (wl_surface 4, else damage), set_buffer_scale (3) and
+  set_buffer_transform (2) on the cursor surface. wl_seat below 3 is
+  ignored (the generated pointer/keyboard destructors send release, v3),
+  and wl_shm is bound at 2 where available (its destructor sends release).
+- destroy() and setCursor() flush their requests: they can run outside
+  dispatchEvents(), and the host otherwise sees them only when it next
+  speaks. Idle callbacks run from a moved copy, since a callback may queue
+  new ones.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/aquamarine/backend/Wayland.hpp |   6 +-
+ src/backend/Wayland.cpp                | 102 ++++++++++++++++---------
+ 2 files changed, 70 insertions(+), 38 deletions(-)
+
+diff --git a/include/aquamarine/backend/Wayland.hpp b/include/aquamarine/backend/Wayland.hpp
+index 2450b10..c35a6eb 100644
+--- a/include/aquamarine/backend/Wayland.hpp
++++ b/include/aquamarine/backend/Wayland.hpp
+@@ -122,7 +122,7 @@ namespace Aquamarine {
+             Hyprutils::Math::Vector2D                                  size;
+             uint32_t                                                   format     = 0;
+             uint64_t                                                   seq        = 0;
+-            bool                                                       configured = false; // first xdg_surface.configure acked
++            bool                                                       configured = false; // first xdg_surface.configure acked (both modes)
+             bool                                                       presented  = false; // a buffer has been attached
+             std::optional<SShmPending>                                 pending;
+             // pixels copied without a signaled fence (the frame had none): copied again from the same
+@@ -140,7 +140,7 @@ namespace Aquamarine {
+                 uint64_t                              pixels  = 0;
+                 double                                readyMs = 0, readyMax = 0, mapMs = 0, mapMax = 0, copyMs = 0, copyMax = 0;
+             } stats;
+-            std::optional<Hyprutils::Math::Vector2D>   pendingConfigure; // xdg_toplevel size, applied after the ack
++            std::optional<Hyprutils::Math::Vector2D>   pendingConfigure; // xdg_toplevel size, applied after the ack (both modes)
+         } shmState;
+ 
+         // frame loop — unified scheduler shared with DRM. See CFrameScheduler.
+@@ -173,6 +173,8 @@ namespace Aquamarine {
+         // callbacks after the events of the same dispatch. A size the host configured before that
+         // reached no listener: announce() hands it over again.
+         void                                     announce();
++        // the output's single, preferred mode: the size of the window the host gives us
++        void                                     setHostMode(const Hyprutils::Math::Vector2D& size);
+         bool                                     announced = false;
+         std::optional<Hyprutils::Math::Vector2D> unannouncedSize;
+ 
+diff --git a/src/backend/Wayland.cpp b/src/backend/Wayland.cpp
+index 0710dba..4a6e33c 100644
+--- a/src/backend/Wayland.cpp
++++ b/src/backend/Wayland.cpp
+@@ -127,8 +127,10 @@ bool Aquamarine::CWaylandBackend::start() {
+ 
+         // Bind at the version the host advertises, up to the one we implement. Binding above the
+         // advertised version is a protocol error ("invalid version for global"), which kills the
+-        // connection on hosts that check it (e.g. wlroots offers xdg_wm_base 5). Everything we
+-        // send exists in the lower versions too; damage_buffer needs wl_compositor 4.
++        // connection on hosts that check it (e.g. wlroots offers xdg_wm_base 5). Requests newer than
++        // the bound version are only sent when it allows them (damage_buffer needs wl_surface 4,
++        // set_buffer_scale 3, set_buffer_transform 2); wl_seat below 3 is ignored, since the
++        // generated pointer/keyboard destructors send release (version 3).
+         const auto BIND = [&](const wl_interface* iface, uint32_t ours) {
+             const uint32_t V = std::min(version, ours);
+             if (V < ours)
+@@ -138,6 +140,11 @@ bool Aquamarine::CWaylandBackend::start() {
+         };
+ 
+         if (NAME == "wl_seat") {
++            if (version < 3) {
++                backend->log(AQ_LOG_WARNING, std::format("Wayland backend: ignoring wl_seat version {}, version 3 is needed", version));
++                return;
++            }
++
+             waylandState.seat = makeShared<CCWlSeat>(BIND(&wl_seat_interface, 9));
+             initSeat();
+         } else if (NAME == "xdg_wm_base") {
+@@ -146,7 +153,8 @@ bool Aquamarine::CWaylandBackend::start() {
+         } else if (NAME == "wl_compositor") {
+             waylandState.compositor = makeShared<CCWlCompositor>(BIND(&wl_compositor_interface, 6));
+         } else if (NAME == "wl_shm") {
+-            waylandState.shm = makeShared<CCWlShm>(BIND(&wl_shm_interface, 1));
++            // 2 where available: the generated destructor sends wl_shm.release, which is version 2
++            waylandState.shm = makeShared<CCWlShm>(BIND(&wl_shm_interface, 2));
+         } else if (NAME == "zwp_linux_dmabuf_v1") {
+             if (version < 4) {
+                 // the default feedback (main device, format table) needs version 4
+@@ -257,10 +265,12 @@ bool Aquamarine::CWaylandBackend::dispatchEvents() {
+ 
+     // dispatch frames
+     if (backend->ready) {
+-        for (auto const& f : idleCallbacks) {
++        // run them from a moved copy: a callback may queue new ones (e.g. a consumer that creates
++        // an output in its newOutput handler)
++        auto callbacks = std::exchange(idleCallbacks, {});
++        for (auto const& f : callbacks) {
+             f();
+         }
+-        idleCallbacks.clear();
+     }
+ 
+     if (shmPresent.enabled) {
+@@ -689,21 +699,39 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
+         backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: configure surface with {}", name, serial));
+         r->sendAckConfigure(serial);
+ 
+-        if (!backend->shmPresent.enabled)
+-            return;
+-
+-        // wl_shm mode: apply the toplevel configure only now that it is acked, so the frame the
+-        // consumer renders in response is never attached to an unconfigured xdg_surface
+-        // (xdg_surface.unconfigured_buffer). Still within the same dispatch.
++        // Apply the toplevel configure only now that it is acked, so the frame the consumer renders
++        // in response is never attached to an unconfigured xdg_surface (xdg_surface.unconfigured_buffer,
++        // which strict hosts like wlroots enforce). Still within the same dispatch.
+         shmState.configured = true;
+         if (!shmState.pendingConfigure)
+             return;
+ 
+-        const auto SIZE = *shmState.pendingConfigure;
++        auto SIZE = *shmState.pendingConfigure;
+         shmState.pendingConfigure.reset();
+-        if (!announced)
+-            unannouncedSize = SIZE;
++        const bool HOST_SIZE = SIZE.x > 0 && SIZE.y > 0; // 0x0: the host lets us choose
++        if (!HOST_SIZE) {
++            backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: w/h is 0, sending default hardcoded 1280x720", name));
++            SIZE = {1280, 720};
++        }
++
++        // The output's one mode follows the window the host gives us, so that a consumer's "preferred"
++        // monitor rule resolves to it, also when the consumer re-applies its rules later (Hyprland on
++        // a config reload); with no modes such a rule had nothing to pick.
++        setHostMode(SIZE);
++
++        if (!announced) {
++            // Nobody listens to this output yet (see announce()). A size the host chose is handed
++            // over once it is announced. Our own default is only the preferred mode: replayed as a
++            // state event it would override the consumer's explicit monitor rules.
++            if (HOST_SIZE)
++                unannouncedSize = SIZE;
++            return;
++        }
++
+         events.state.emit(SStateEvent{.size = SIZE});
++        // Kick off the first frame synchronously: the consumer expects events.frame in the same
++        // dispatch cycle as the configure. Deferring via scheduleFrame's idle races the first commit
++        // and can leave the output blank until the next event.
+         needsFrame = true;
+         sched.frameReady.emit();
+     });
+@@ -720,25 +748,7 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
+ 
+     waylandState.xdgToplevel->setConfigure([this](CCXdgToplevel* r, int32_t w, int32_t h, wl_array* arr) {
+         backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: configure toplevel with {}x{}", name, w, h));
+-        if (w == 0 || h == 0) {
+-            backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: w/h is 0, sending default hardcoded 1280x720", name));
+-            w = 1280;
+-            h = 720;
+-        }
+-
+-        if (backend->shmPresent.enabled) {
+-            shmState.pendingConfigure = Vector2D{w, h}; // applied by xdg_surface.configure, after the ack
+-            return;
+-        }
+-
+-        if (!announced)
+-            unannouncedSize = Vector2D{w, h};
+-        events.state.emit(SStateEvent{.size = {w, h}});
+-        // Kick off the first frame synchronously: the consumer expects events.frame in
+-        // the same dispatch cycle as the toplevel configure. Deferring via scheduleFrame's
+-        // idle races the first commit and can leave the output blank until the next event.
+-        needsFrame = true;
+-        sched.frameReady.emit();
++        shmState.pendingConfigure = Vector2D{w, h}; // applied by xdg_surface.configure, after the ack
+     });
+ 
+     waylandState.xdgToplevel->setClose([this](CCXdgToplevel* r) { destroy(); });
+@@ -758,6 +768,13 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
+     backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: initialized", name));
+ }
+ 
++void Aquamarine::CWaylandOutput::setHostMode(const Vector2D& size) {
++    if (!modes.empty() && modes.front()->pixelSize == size)
++        return;
++
++    modes = {makeShared<SOutputMode>(SOutputMode{.pixelSize = size, .refreshRate = 60000, .preferred = true})};
++}
++
+ void Aquamarine::CWaylandOutput::announce() {
+     announced = true;
+     if (!unannouncedSize)
+@@ -812,6 +829,8 @@ bool Aquamarine::CWaylandOutput::destroy() {
+     closeShmRecopyTimer();
+     waylandState.surface->sendAttach(nullptr, 0, 0);
+     waylandState.surface->sendCommit();
++    // may run outside dispatchEvents() (e.g. a consumer removing the output): unmap the host window now
++    wl_display_flush(backend->waylandState.display);
+     waylandState.frameCallback.reset();
+     sched.invalidate();
+     std::erase(backend->outputs, self.lock());
+@@ -908,7 +927,11 @@ bool Aquamarine::CWaylandOutput::commit() {
+     wlBuffer->pendingRelease = true;
+ 
+     waylandState.surface->sendAttach(wlBuffer->waylandState.buffer.get(), 0, 0);
+-    waylandState.surface->sendDamageBuffer(0, 0, INT32_MAX, INT32_MAX);
++    // damage_buffer is wl_surface version 4; scale 1 and the normal transform make damage equivalent
++    if (wl_proxy_get_version((wl_proxy*)waylandState.surface->resource()) >= 4)
++        waylandState.surface->sendDamageBuffer(0, 0, INT32_MAX, INT32_MAX);
++    else
++        waylandState.surface->sendDamage(0, 0, INT32_MAX, INT32_MAX);
+ 
+     // Register the next wl_surface.frame callback as part of this commit's pending state,
+     // but only if one isn't already pending. A consumer that commits twice in quick
+@@ -1072,8 +1095,13 @@ bool Aquamarine::CWaylandOutput::setCursor(Hyprutils::Memory::CSharedPointer<IBu
+         return false;
+     }
+ 
+-    cursorState.cursorSurface->sendSetBufferScale(1);
+-    cursorState.cursorSurface->sendSetBufferTransform(WL_OUTPUT_TRANSFORM_NORMAL);
++    // set_buffer_scale is wl_surface version 3, set_buffer_transform version 2; both only restate
++    // the defaults
++    const auto CURSOR_VERSION = wl_proxy_get_version((wl_proxy*)cursorState.cursorSurface->resource());
++    if (CURSOR_VERSION >= 3)
++        cursorState.cursorSurface->sendSetBufferScale(1);
++    if (CURSOR_VERSION >= 2)
++        cursorState.cursorSurface->sendSetBufferTransform(WL_OUTPUT_TRANSFORM_NORMAL);
+     cursorState.cursorSurface->sendAttach(cursorState.cursorWlBuffer.get(), 0, 0);
+     cursorState.cursorSurface->sendDamage(0, 0, INT32_MAX, INT32_MAX);
+     cursorState.cursorSurface->sendCommit();
+@@ -1082,6 +1110,8 @@ bool Aquamarine::CWaylandOutput::setCursor(Hyprutils::Memory::CSharedPointer<IBu
+     if (!backend->pointers.empty() && cursorState.serial)
+         backend->pointers.at(0)->pointer->sendSetCursor(cursorState.serial, cursorState.cursorSurface.get(), cursorState.hotspot.x, cursorState.hotspot.y);
+ 
++    // may run outside dispatchEvents(): don't leave the requests queued until the host speaks
++    wl_display_flush(backend->waylandState.display);
+     return true;
+ }
+ 

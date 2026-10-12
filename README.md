@@ -18,6 +18,9 @@ patches/0003-wayland-replay-configure-before-announce.patch      no perder el ta
 patches/0004-wayland-shm-presentation-stats.patch               tiempos de presentación con AQ_WAYLAND_SHM_STATS=1
 patches/0005-wayland-shm-mmap-by-default.patch                  leer los cuadros con mmap del dmabuf (10x más rápido)
 patches/0006-wayland-flush-new-output.patch                     mandar enseguida los pedidos de una salida nueva
+patches/0007-wayland-configure-after-ack-host-mode-version-guards.patch
+                                                            aplicar el tamaño tras el ack, un modo preferido
+                                                            con el tamaño del host y guardas de versión
 hyprgraphics/patches/0001-asyncresourcegatherer-await-lost-wakeup.patch
                                                             hyprgraphics 0.5.1: await() se colgaba para siempre
 hyprgraphics/tests/await_finished.cpp                       test determinista de ese cuelgue
