@@ -12,7 +12,10 @@ Se compila como un `libaquamarine.so.14` de reemplazo. Se instala en `/opt/aquam
 se carga con `LD_LIBRARY_PATH`. Hyprland no se toca.
 
 ```
-patches/0001-wayland-wl_shm-presentation-fallback.patch   el parche (git apply en la raíz de aquamarine v0.15.1)
+patches/0001-wayland-wl_shm-presentation-fallback.patch   presentar por wl_shm (el parche principal)
+patches/0002-wayland-bind-globals-at-advertised-version.patch   no pedir versiones de protocolo que el host no ofrece
+patches/0003-wayland-replay-configure-before-announce.patch      no perder el tamaño que el host manda al arrancar
+                                                            (se aplican en orden con git apply en la raíz de aquamarine v0.15.1)
 .github/workflows/build.yml                                 build en GitHub Actions (Arch Linux ARM, aarch64)
 tests/shm_copy_test.cpp                                     test de CPU de la lógica de copia, del bookkeeping y del bucle de frames
 ```
@@ -34,6 +37,17 @@ El backend Wayland de aquamarine falla por tres motivos:
 - Solo sabe presentar frames como `wl_buffer` dmabuf (`Wayland.cpp:864-883`).
 
 El compositor de omalauncher solo tiene `wl_shm`, con XRGB8888 y ARGB8888.
+
+Los parches 0002 y 0003 corrigen dos fallos que también tiene aquamarine sin modificar al
+correr anidado. Los encontró la primera prueba, dentro de sway:
+
+- **0002:** aquamarine pedía siempre `xdg_wm_base` 6, `wl_seat` 9 y `wl_compositor` 6. sway ofrece
+  `xdg_wm_base` 5, y pedir más de lo ofrecido es un error de protocolo que corta la conexión:
+  `invalid version for global xdg_wm_base (11): expected at most 5, got 6`. Ahora pide
+  `min(ofrecida, propia)`.
+- **0003:** la salida se anuncia a Hyprland después de procesar los eventos del mismo lote. Si el
+  primer `configure` del host llega en ese lote, el tamaño se pierde y Hyprland se queda sin modo
+  (`NO PREFERRED MODE`, 0x0). Ahora ese tamaño se entrega otra vez justo después de anunciarla.
 
 ## Qué hace el parche
 
@@ -162,7 +176,7 @@ Qué hace el workflow (`ubuntu-24.04-arm` con el contenedor `menci/archlinuxarm:
    seatd libinput systemd-libs pixman libdisplay-info hwdata`.
 2. Clona aquamarine en `v0.15.1` y **falla** si el tag no apunta exactamente a
    `f31c47a1b9d300847d8fc3108ad959448103dfc1`.
-3. Aplica el parche (`git apply --check` y luego `git apply`).
+3. Aplica los parches en orden (`git apply --check` y luego `git apply`).
 4. `cmake -DCMAKE_BUILD_TYPE=None -DCMAKE_INSTALL_PREFIX=/opt/aquamarine-shm` con los flags de
    `/etc/makepkg.conf`, como el paquete de Arch (sin `-Wl,--as-needed` aparecería
    `libGLESv2.so.2` en `NEEDED`), compila e instala en un directorio de staging.
@@ -326,7 +340,7 @@ lo quita (bajo tu responsabilidad).
 
 ```sh
 git clone --branch v0.15.1 https://github.com/hyprwm/aquamarine && cd aquamarine
-git apply ../aquamarine-omalauncher/patches/0001-wayland-wl_shm-presentation-fallback.patch
+for p in ../aquamarine-omalauncher/patches/0*.patch; do git apply "$p"; done
 g++ -std=c++23 -O2 -I src/backend -I /usr/include/pixman-1 \
     ../aquamarine-omalauncher/tests/shm_copy_test.cpp -lhyprutils -lpixman-1 -o shm_copy_test
 ./shm_copy_test

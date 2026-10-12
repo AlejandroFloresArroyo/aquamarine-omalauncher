@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AlejandroFloresArroyo
+ <26047316+AlejandroFloresArroyo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 01:37:34 -0600
+Subject: [PATCH 1/2] wayland: bind globals at the version the host advertises
+
+The Wayland backend bound wl_seat 9, xdg_wm_base 6, wl_compositor 6 and
+zwp_linux_dmabuf_v1 4 whatever the host offered. Binding above the
+advertised version is a protocol error, so on a host with an older
+xdg-shell (wlroots/sway advertises xdg_wm_base 5) the connection died at
+startup:
+
+  wl_registry#2: error 0: invalid version for global xdg_wm_base (11):
+  expected at most 5, got 6
+
+and the nested output never got a size. Bind min(advertised, ours)
+instead: every request the backend sends exists in the lower versions
+(damage_buffer needs wl_compositor 4). zwp_linux_dmabuf_v1 below 4 is
+ignored, since the default feedback the backend relies on is version 4.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/backend/Wayland.cpp | 34 +++++++++++++++++++++++-----------
+ 1 file changed, 23 insertions(+), 11 deletions(-)
+
+diff --git a/src/backend/Wayland.cpp b/src/backend/Wayland.cpp
+index bae0330..fcbd5ee 100644
+--- a/src/backend/Wayland.cpp
++++ b/src/backend/Wayland.cpp
+@@ -125,24 +125,36 @@ bool Aquamarine::CWaylandBackend::start() {
+ 
+         const std::string NAME = name;
+ 
++        // Bind at the version the host advertises, up to the one we implement. Binding above the
++        // advertised version is a protocol error ("invalid version for global"), which kills the
++        // connection on hosts that check it (e.g. wlroots offers xdg_wm_base 5). Everything we
++        // send exists in the lower versions too; damage_buffer needs wl_compositor 4.
++        const auto BIND = [&](const wl_interface* iface, uint32_t ours) {
++            const uint32_t V = std::min(version, ours);
++            if (V < ours)
++                backend->log(AQ_LOG_DEBUG, std::format("Wayland backend: the host offers {} version {}, binding that instead of {}", name, version, ours));
++            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, V, id)));
++            return (wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, iface, V);
++        };
++
+         if (NAME == "wl_seat") {
+-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 9, id)));
+-            waylandState.seat = makeShared<CCWlSeat>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_seat_interface, 9));
++            waylandState.seat = makeShared<CCWlSeat>(BIND(&wl_seat_interface, 9));
+             initSeat();
+         } else if (NAME == "xdg_wm_base") {
+-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 6, id)));
+-            waylandState.xdg = makeShared<CCXdgWmBase>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &xdg_wm_base_interface, 6));
++            waylandState.xdg = makeShared<CCXdgWmBase>(BIND(&xdg_wm_base_interface, 6));
+             initShell();
+         } else if (NAME == "wl_compositor") {
+-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 6, id)));
+-            waylandState.compositor = makeShared<CCWlCompositor>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_compositor_interface, 6));
++            waylandState.compositor = makeShared<CCWlCompositor>(BIND(&wl_compositor_interface, 6));
+         } else if (NAME == "wl_shm") {
+-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 1, id)));
+-            waylandState.shm = makeShared<CCWlShm>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_shm_interface, 1));
++            waylandState.shm = makeShared<CCWlShm>(BIND(&wl_shm_interface, 1));
+         } else if (NAME == "zwp_linux_dmabuf_v1") {
+-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 4, id)));
+-            waylandState.dmabuf =
+-                makeShared<CCZwpLinuxDmabufV1>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &zwp_linux_dmabuf_v1_interface, 4));
++            if (version < 4) {
++                // the default feedback (main device, format table) needs version 4
++                backend->log(AQ_LOG_WARNING, std::format("Wayland backend: ignoring zwp_linux_dmabuf_v1 version {}, version 4 is needed", version));
++                return;
++            }
++
++            waylandState.dmabuf = makeShared<CCZwpLinuxDmabufV1>(BIND(&zwp_linux_dmabuf_v1_interface, 4));
+             if (!initDmabuf()) {
+                 backend->log(AQ_LOG_ERROR, "Wayland backend cannot start: zwp_linux_dmabuf_v1 init failed");
+                 waylandState.dmabufFailed = true;

@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AlejandroFloresArroyo
+ <26047316+AlejandroFloresArroyo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 01:39:15 -0600
+Subject: [PATCH 2/2] wayland: hand over a configure that came before the
+ output was announced
+
+createOutput() emits newOutput from the backend's idle callbacks, which
+dispatchEvents() runs after the Wayland events it read. When the host's
+configure for the new toplevel arrives in that same read, its size goes to
+events.state before the consumer listens to the output, and is lost.
+Hyprland then has no mode for the output ("NO PREFERRED MODE", 0x0),
+retries three times and gives up. It never maps a buffer, so the host has
+no reason to configure again.
+
+Remember a size emitted before the output was announced and emit it again,
+together with a frame, right after newOutput.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/aquamarine/backend/Wayland.hpp |  7 +++++++
+ src/backend/Wayland.cpp                | 25 ++++++++++++++++++++++++-
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/include/aquamarine/backend/Wayland.hpp b/include/aquamarine/backend/Wayland.hpp
+index 1cd7d57..18273de 100644
+--- a/include/aquamarine/backend/Wayland.hpp
++++ b/include/aquamarine/backend/Wayland.hpp
+@@ -160,6 +160,13 @@ namespace Aquamarine {
+             Hyprutils::Math::Vector2D                        surfaceSize;
+         } waylandState;
+ 
++        // The consumer learns about this output from newOutput, emitted from the backend's idle
++        // callbacks after the events of the same dispatch. A size the host configured before that
++        // reached no listener: announce() hands it over again.
++        void                                     announce();
++        bool                                     announced = false;
++        std::optional<Hyprutils::Math::Vector2D> unannouncedSize;
++
+         friend class CWaylandBackend;
+         friend class CWaylandPointer;
+     };
+diff --git a/src/backend/Wayland.cpp b/src/backend/Wayland.cpp
+index fcbd5ee..5b37241 100644
+--- a/src/backend/Wayland.cpp
++++ b/src/backend/Wayland.cpp
+@@ -214,7 +214,10 @@ bool Aquamarine::CWaylandBackend::createOutput(const std::string& szName) {
+     o->self = o;
+     if (backend->ready)
+         o->swapchain = CSwapchain::create(backend->primaryAllocator, self.lock());
+-    idleCallbacks.emplace_back([this, o]() { backend->events.newOutput.emit(SP<IOutput>(o)); });
++    idleCallbacks.emplace_back([this, o]() {
++        backend->events.newOutput.emit(SP<IOutput>(o));
++        o->announce();
++    });
+     return true;
+ }
+ 
+@@ -689,6 +692,8 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
+ 
+         const auto SIZE = *shmState.pendingConfigure;
+         shmState.pendingConfigure.reset();
++        if (!announced)
++            unannouncedSize = SIZE;
+         events.state.emit(SStateEvent{.size = SIZE});
+         needsFrame = true;
+         sched.frameReady.emit();
+@@ -717,6 +722,8 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
+             return;
+         }
+ 
++        if (!announced)
++            unannouncedSize = Vector2D{w, h};
+         events.state.emit(SStateEvent{.size = {w, h}});
+         // Kick off the first frame synchronously: the consumer expects events.frame in
+         // the same dispatch cycle as the toplevel configure. Deferring via scheduleFrame's
+@@ -742,6 +749,22 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
+     backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: initialized", name));
+ }
+ 
++void Aquamarine::CWaylandOutput::announce() {
++    announced = true;
++    if (!unannouncedSize)
++        return;
++
++    // The host configured this output in the dispatch that announced it, before the consumer
++    // listened: hand the size over again and ask for a frame, as the configure handlers do.
++    // Without this the consumer never learns the size (Hyprland: "NO PREFERRED MODE", 0x0).
++    const auto SIZE = *unannouncedSize;
++    unannouncedSize.reset();
++    backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: the host configured {}x{} before the output was announced, handing it over again", name, SIZE.x, SIZE.y));
++    events.state.emit(SStateEvent{.size = SIZE});
++    needsFrame = true;
++    sched.frameReady.emit();
++}
++
+ Aquamarine::CWaylandOutput::~CWaylandOutput() {
+     events.destroy.emit();
+     // frameIdle captures a raw this and may still be queued; pull it before we die.

@@ -1,6 +1,6 @@
 name: build aquamarine-shm
 
-# Builds aquamarine v0.15.1 with patches/0001-wayland-wl_shm-presentation-fallback.patch for
+# Builds aquamarine v0.15.1 with patches/*.patch (applied in order) for
 # Arch Linux ARM (aarch64). The result is a drop-in libaquamarine.so.14 installed under
 # /opt/aquamarine-shm, to be loaded with LD_LIBRARY_PATH=/opt/aquamarine-shm/lib.
 
@@ -76,13 +76,15 @@ jobs:
             exit 1
           fi
 
-      - name: Apply the wl_shm patch
+      - name: Apply the patches
         run: |
           set -euxo pipefail
-          PATCH="$GITHUB_WORKSPACE/aquamarine-shm/patches/0001-wayland-wl_shm-presentation-fallback.patch"
-          sha256sum "$PATCH"
-          git -C aquamarine apply --check --verbose "$PATCH"
-          git -C aquamarine apply "$PATCH"
+          # patches/NNNN-*.patch, in order, each on top of the previous ones
+          for PATCH in "$GITHUB_WORKSPACE"/aquamarine-shm/patches/[0-9][0-9][0-9][0-9]-*.patch; do
+            sha256sum "$PATCH"
+            git -C aquamarine apply --check --verbose "$PATCH"
+            git -C aquamarine apply "$PATCH"
+          done
           git -C aquamarine status --short
 
       - name: Configure
@@ -165,9 +167,10 @@ jobs:
           install -Dm644 aquamarine/LICENSE "stage$PREFIX/share/licenses/aquamarine/LICENSE"
           install -Dm644 aquamarine-shm/LICENSE "stage$PREFIX/share/licenses/aquamarine-omalauncher/LICENSE"
           {
-            echo "aquamarine $AQ_TAG ($(git -C aquamarine rev-parse HEAD)) + wl_shm presentation patch"
+            echo "aquamarine $AQ_TAG ($(git -C aquamarine rev-parse HEAD)) + the patches below"
             echo "drop-in for: hyprland 0.56.2 + aquamarine 0.15.1 (libaquamarine.so.14) + hyprutils with libhyprutils.so.13"
-            echo "patch sha256: $(sha256sum aquamarine-shm/patches/0001-wayland-wl_shm-presentation-fallback.patch | cut -d' ' -f1)"
+            echo "patches (sha256):"
+            (cd aquamarine-shm/patches && sha256sum [0-9][0-9][0-9][0-9]-*.patch | sed 's/^/  /')
             echo "built by: $GITHUB_REPOSITORY@$GITHUB_SHA, run $GITHUB_RUN_ID"
             echo "built against:"
             pacman -Q glibc gcc hyprutils wayland libdrm mesa libinput seatd libdisplay-info pixman | sed 's/^/  /'
