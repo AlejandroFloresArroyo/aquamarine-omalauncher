@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AlejandroFloresArroyo
+ <26047316+AlejandroFloresArroyo@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 02:12:42 -0600
+Subject: [PATCH] wayland: read wl_shm frames through a dmabuf mmap by default
+
+Measured on the target (Xclipse 540, zink on RADV, Hyprland nested in
+sway, 758x1247): gbm_bo_map took 3.7-5.7 ms per frame because it maps,
+and with zink copies, the whole buffer every frame; the persistent dmabuf
+mmap bracketed by DMA_BUF_IOCTL_SYNC took 0.4-0.7 ms. Frame rates went
+from ~70 to ~82 per second for small updates and from ~45 to ~51 for a
+terminal flooding text, and the host showed the same pixels Hyprland
+rendered. gbm_bo_map stays as the fallback for buffers the kernel refuses
+to map, and AQ_WAYLAND_SHM_MMAP=0 selects it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/env.md                            |  2 +-
+ include/aquamarine/backend/Wayland.hpp |  4 ++--
+ src/backend/Wayland.cpp                | 11 +++++++----
+ 3 files changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/docs/env.md b/docs/env.md
+index 9ffd370..cd84419 100644
+--- a/docs/env.md
++++ b/docs/env.md
+@@ -21,7 +21,7 @@ Unless specified otherwise, a variable is enabled if and only if it's set to `1`
+ 
+ `AQ_WAYLAND_SHM_PRESENT` -> Present output frames to the host compositor as wl_shm copies. Used automatically when the host has no (working) `zwp_linux_dmabuf_v1`; `1` forces it, `0` disables it.
+ `AQ_WAYLAND_RENDER_NODE` -> In wl_shm mode, the DRM render node to allocate and render on. Default `/dev/dri/renderD128`. Only render nodes are accepted.
+-`AQ_WAYLAND_SHM_MMAP` -> In wl_shm mode, `1` reads rendered buffers through a direct mmap of the dmabuf instead of `gbm_bo_map` (the default).
++`AQ_WAYLAND_SHM_MMAP` -> In wl_shm mode, rendered buffers are read through a direct mmap of the dmabuf, bracketed by `DMA_BUF_IOCTL_SYNC` (falling back to `gbm_bo_map` for a buffer the kernel refuses to map); `0` always reads through `gbm_bo_map`.
+ `AQ_WAYLAND_SHM_DMABUF_SYNC` -> In wl_shm mode, bracket reads with `DMA_BUF_IOCTL_SYNC`: unset for frames without a fence, re-copies and direct mmap reads; `1` always; `0` never.
+ `AQ_WAYLAND_SHM_RECOPY` -> In wl_shm mode, read pixels again one host frame later: unset only for frames without a fence; `1` every frame; `0` never.
+ `AQ_WAYLAND_SHM_STATS` -> In wl_shm mode, `1` logs every 5 s how long frames wait for the GPU, how long mapping and copying take, and how much is copied.
+diff --git a/include/aquamarine/backend/Wayland.hpp b/include/aquamarine/backend/Wayland.hpp
+index 891e025..2450b10 100644
+--- a/include/aquamarine/backend/Wayland.hpp
++++ b/include/aquamarine/backend/Wayland.hpp
+@@ -79,7 +79,7 @@ namespace Aquamarine {
+             uint64_t                                       syncSeq = 0;      // when it was last brought up to date (0: never)
+         };
+ 
+-        // read-only CPU mapping of a swapchain buffer, kept for the buffer's lifetime (AQ_WAYLAND_SHM_MMAP=1 only)
++        // read-only CPU mapping of a swapchain buffer, kept for the buffer's lifetime (not with AQ_WAYLAND_SHM_MMAP=0)
+         struct SShmSource {
+             ~SShmSource();
+             Hyprutils::Memory::CWeakPointer<IBuffer> buffer;
+@@ -288,7 +288,7 @@ namespace Aquamarine {
+             bool                           enabled = false;
+             std::vector<SDRMFormat>        formats;             // LINEAR XRGB8888 / ARGB8888, so the CPU can read the buffers
+             int                            dmabufSync  = -1;    // AQ_WAYLAND_SHM_DMABUF_SYNC: -1 auto (see copyToShm), 0 never, 1 always
+-            bool                           mmapSources = false; // AQ_WAYLAND_SHM_MMAP=1: read through a direct mmap of the dmabuf, not gbm_bo_map
++            bool                           mmapSources = true;  // read through a direct mmap of the dmabuf; AQ_WAYLAND_SHM_MMAP=0: through gbm_bo_map
+             int                            recopy      = -1;    // AQ_WAYLAND_SHM_RECOPY: -1 frames without a fence, 0 never, 1 every frame
+             bool                           stats       = false; // AQ_WAYLAND_SHM_STATS=1: log presentation timings
+             Hyprutils::OS::CFileDescriptor epollFD;             // fences of pending frames and re-copy timers, polled by the consumer
+diff --git a/src/backend/Wayland.cpp b/src/backend/Wayland.cpp
+index 770406f..b14096b 100644
+--- a/src/backend/Wayland.cpp
++++ b/src/backend/Wayland.cpp
+@@ -578,7 +578,10 @@ bool Aquamarine::CWaylandBackend::initShmPresentation(const std::string& reason)
+     shmPresent.dmabufSync  = TRISTATE("AQ_WAYLAND_SHM_DMABUF_SYNC");
+     shmPresent.recopy      = TRISTATE("AQ_WAYLAND_SHM_RECOPY");
+     shmPresent.stats       = envEnabled("AQ_WAYLAND_SHM_STATS");
+-    shmPresent.mmapSources = envEnabled("AQ_WAYLAND_SHM_MMAP"); // opt-in: gbm_bo_map is the path verified on real hardware
++    // A persistent mmap of the dmabuf, bracketed by DMA_BUF_IOCTL_SYNC, reads a frame about 10x faster
++    // than gbm_bo_map, which maps (and with zink, copies) the whole buffer every frame: on an Xclipse 540
++    // with zink, ~0.5 ms instead of ~4-6 ms per frame for a 758x1247 output, with identical pixels.
++    shmPresent.mmapSources = !envExplicitlyDisabled("AQ_WAYLAND_SHM_MMAP");
+     shmPresent.enabled     = true;
+ 
+     // Frames wait for their GPU fence without blocking the consumer: the fence goes into this epoll
+@@ -590,7 +593,7 @@ bool Aquamarine::CWaylandBackend::initShmPresentation(const std::string& reason)
+     backend->log(AQ_LOG_WARNING,
+                  std::format("Wayland backend: presenting through wl_shm copies ({}). Rendering on {}, buffers LINEAR XRGB8888/ARGB8888, no hardware cursor, reading "
+                              "through {}",
+-                             reason, drmState.nodeName, shmPresent.mmapSources ? "mmap of the dmabuf (AQ_WAYLAND_SHM_MMAP=1)" : "gbm_bo_map"));
++                             reason, drmState.nodeName, shmPresent.mmapSources ? "a mmap of the dmabuf" : "gbm_bo_map (AQ_WAYLAND_SHM_MMAP=0)"));
+     return true;
+ }
+ 
+@@ -1583,8 +1586,8 @@ void Aquamarine::CWaylandOutput::checkShmFenceAge() {
+ }
+ 
+ bool Aquamarine::CWaylandOutput::copyToShm(const SShmPending& P, SShmBuffer& dst, const std::vector<pixman_box32_t>& RECTS) {
+-    // Read through gbm_bo_map (default: the path verified on the target) or, with
+-    // AQ_WAYLAND_SHM_MMAP=1, through a persistent mmap of the dmabuf.
++    // Read through a persistent mmap of the dmabuf (default) or, with AQ_WAYLAND_SHM_MMAP=0 or for a
++    // buffer the kernel refused to map, through gbm_bo_map.
+     const auto SOURCE = backend->shmPresent.mmapSources ? shmSourceFor(P.source, P.attrs) : nullptr;
+     const bool DIRECT = SOURCE && SOURCE->data;
+ 

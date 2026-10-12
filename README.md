@@ -16,6 +16,7 @@ patches/0001-wayland-wl_shm-presentation-fallback.patch   presentar por wl_shm (
 patches/0002-wayland-bind-globals-at-advertised-version.patch   no pedir versiones de protocolo que el host no ofrece
 patches/0003-wayland-replay-configure-before-announce.patch      no perder el tamaño que el host manda al arrancar
 patches/0004-wayland-shm-presentation-stats.patch               tiempos de presentación con AQ_WAYLAND_SHM_STATS=1
+patches/0005-wayland-shm-mmap-by-default.patch                  leer los cuadros con mmap del dmabuf (10x más rápido)
                                                             (se aplican en orden con git apply en la raíz de aquamarine v0.15.1)
 .github/workflows/build.yml                                 build en GitHub Actions (Arch Linux ARM, aarch64)
 tests/shm_copy_test.cpp                                     test de CPU de la lógica de copia, del bookkeeping y del bucle de frames
@@ -81,10 +82,12 @@ Si el host no tiene un `zwp_linux_dmabuf_v1` utilizable, o si se fuerza con
      output) y se copian en él **solo los rectángulos que ese buffer tiene desactualizados**. Con
      el host de omalauncher, que copia y suelta el buffer enseguida, normalmente basta un buffer y
      lo copiado es el daño del frame.
-   - **Lectura.** Por defecto con `gbm_bo_map` (el camino verificado en el teléfono). Con
-     `AQ_WAYLAND_SHM_MMAP=1`, con un `mmap` persistente del dmabuf, entre
+   - **Lectura.** Desde el parche 0005, por defecto con un `mmap` persistente del dmabuf, entre
      `DMA_BUF_IOCTL_SYNC(START)` y `(END)` como exige la uAPI de dma-buf (salvo
-     `AQ_WAYLAND_SHM_DMABUF_SYNC=0`).
+     `AQ_WAYLAND_SHM_DMABUF_SYNC=0`). Medido en la tableta: ~0.5 ms por cuadro contra 4-6 ms de
+     `gbm_bo_map`, que mapea (y con zink copia) el buffer entero en cada cuadro, con los mismos
+     píxeles. `gbm_bo_map` queda como respaldo si el kernel no deja mapear un buffer, y
+     `AQ_WAYLAND_SHM_MMAP=0` lo fuerza.
    - **Envío.** `attach`, `wl_surface.damage` (v1) solo con lo que cambió desde la última copia
      del host (por encima de 32 rectángulos, su caja envolvente), `frame` si no hay uno en vuelo,
      `commit` y un único `wl_display_flush`: un `sendmsg` por frame y ningún roundtrip.
@@ -315,17 +318,15 @@ Qué mirar en el log:
 
 | Línea | Significado |
 |---|---|
-| `presenting through wl_shm copies (...) reading through gbm_bo_map` | el modo wl_shm está activo |
+| `presenting through wl_shm copies (...) reading through a mmap of the dmabuf` | el modo wl_shm está activo |
 | `frames arrive without an explicit fence` | Hyprland no da fences: la presentación no está sincronizada con la GPU y se apoya en la re-copia a los 25 ms |
 | `the frame's GPU fence has not signaled after N ms` | la GPU no termina el frame (¿colgada?) |
 | `the host holds all 3 buffers` | el host tarda en soltar buffers; los frames esperan |
 | `cannot present this buffer` | algo intentó presentar un buffer que no es de la swapchain |
 
-**Opcional, cuando lo anterior funcione:** probar la lectura directa con `AQ_WAYLAND_SHM_MMAP=1`
-y compararla con la de por defecto sobre algo que cambie en cada frame (por ejemplo `watch -n 0.1
-date` en el `foot` anidado). Si con `=1` salen píxeles viejos o corruptos, quédate con el valor
-por defecto. Si `DMA_BUF_IOCTL_SYNC` resultara caro en este driver, `AQ_WAYLAND_SHM_DMABUF_SYNC=0`
-lo quita (bajo tu responsabilidad).
+**Si algo se ve raro:** `AQ_WAYLAND_SHM_MMAP=0` vuelve a leer con `gbm_bo_map` (más lento, pero
+es el camino que usa Mesa por dentro). Si `DMA_BUF_IOCTL_SYNC` resultara caro en otro driver,
+`AQ_WAYLAND_SHM_DMABUF_SYNC=0` lo quita (bajo tu responsabilidad).
 
 ### Variables de entorno del parche
 
@@ -333,7 +334,7 @@ lo quita (bajo tu responsabilidad).
 |---|---|---|
 | `AQ_WAYLAND_SHM_PRESENT` | sin definir / `1` / `0` | Automático: se activa si el host no tiene dmabuf. `1` lo fuerza. `0` lo desactiva y deja el error de antes. |
 | `AQ_WAYLAND_RENDER_NODE` | ruta | Nodo de render. Por defecto `/dev/dri/renderD128`; solo acepta render nodes. |
-| `AQ_WAYLAND_SHM_MMAP` | sin definir / `1` | Sin definir: lee con `gbm_bo_map` (verificado). `1`: `mmap` directo del dmabuf entre `DMA_BUF_IOCTL_SYNC`. |
+| `AQ_WAYLAND_SHM_MMAP` | sin definir / `0` | Sin definir: `mmap` directo del dmabuf entre `DMA_BUF_IOCTL_SYNC` (parche 0005; respaldo automático a `gbm_bo_map`). `0`: siempre `gbm_bo_map`. |
 | `AQ_WAYLAND_SHM_DMABUF_SYNC` | sin definir / `1` / `0` | `DMA_BUF_IOCTL_SYNC` alrededor de la lectura. Sin definir: en frames sin fence, en las re-copias y con `AQ_WAYLAND_SHM_MMAP=1`. `1`: siempre. `0`: nunca. |
 | `AQ_WAYLAND_SHM_RECOPY` | sin definir / `1` / `0` | Re-copia a los 25 ms. Sin definir: solo de frames sin fence. `1`: de todos (útil si el último frame de un cambio a veces queda viejo). `0`: nunca. |
 | `AQ_WAYLAND_SHM_STATS` | sin definir / `1` | `1`: cada 5 s registra (nivel debug) cuántos cuadros se presentaron, cuánto esperaron a la GPU, cuánto tardaron el mapeo y la copia y cuántos píxeles se copiaron. |
