@@ -1,0 +1,184 @@
+name: build aquamarine-shm
+
+# Builds aquamarine v0.15.1 with patches/0001-wayland-wl_shm-presentation-fallback.patch for
+# Arch Linux ARM (aarch64). The result is a drop-in libaquamarine.so.14 installed under
+# /opt/aquamarine-shm, to be loaded with LD_LIBRARY_PATH=/opt/aquamarine-shm/lib.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  AQ_REPO: https://github.com/hyprwm/aquamarine
+  AQ_TAG: v0.15.1
+  AQ_COMMIT: f31c47a1b9d300847d8fc3108ad959448103dfc1 # what v0.15.1 points to
+  PREFIX: /opt/aquamarine-shm
+  # NEEDED entries of the stock /usr/lib/libaquamarine.so.14 (aquamarine 0.15.1-1) on the target.
+  # A different list means the artifact may not load there, or would load a second hyprutils
+  # (e.g. a newer libhyprutils soname): the build fails then.
+  EXPECTED_NEEDED: >-
+    libEGL.so.1 libOpenGL.so.0 libseat.so.1 libinput.so.10 libwayland-client.so.0
+    libhyprutils.so.13 libpixman-1.so.0 libdrm.so.2 libgbm.so.1 libudev.so.1
+    libdisplay-info.so.3 libstdc++.so.6 libm.so.6 libgcc_s.so.1 libc.so.6 ld-linux-aarch64.so.1
+  # Newest symbol versions the target's glibc 2.43 and gcc-libs 16.1.1 provide. A library that
+  # needs newer ones would not load there: the build fails then.
+  TARGET_GLIBC_MAX: "2.43"
+  TARGET_GLIBCXX_MAX: "3.4.35"
+  TARGET_CXXABI_MAX: "1.3.17"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: menci/archlinuxarm:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          if ! ls /etc/pacman.d/gnupg/pubring.* >/dev/null 2>&1; then
+            pacman-key --init
+            pacman-key --populate archlinuxarm
+          fi
+          # refresh the keyrings first so that packages signed by new keys verify
+          pacman -Sy --disable-sandbox --noconfirm --needed archlinuxarm-keyring archlinux-keyring
+          # everything aquamarine 0.15.1's CMakeLists.txt asks for:
+          #   OpenGL/GLES3+EGL (libglvnd), hyprwayland-scanner >= 0.4.0, libseat >= 0.8.0 (seatd),
+          #   libinput >= 1.26.0, wayland-client + wayland-scanner (wayland), wayland-protocols,
+          #   hyprutils >= 0.8.0, pixman-1 (pixman), libdrm, gbm (mesa), libudev (systemd-libs),
+          #   libdisplay-info, hwdata; plus the toolchain, pkg-config (pkgconf), git and the
+          #   kernel headers for linux/dma-buf.h (linux-api-headers).
+          pacman -Syu --disable-sandbox --noconfirm --needed \
+            base-devel gcc make binutils cmake pkgconf git linux-api-headers \
+            hyprwayland-scanner hyprutils \
+            wayland wayland-protocols \
+            libglvnd mesa libdrm \
+            seatd libinput systemd-libs \
+            pixman libdisplay-info hwdata
+          pacman -Q glibc gcc cmake hyprwayland-scanner hyprutils wayland wayland-protocols libglvnd mesa libdrm seatd libinput systemd-libs pixman libdisplay-info hwdata
+
+      - name: Check out this repository (patch, tests)
+        uses: actions/checkout@v5
+        with:
+          path: aquamarine-shm
+
+      - name: Fetch aquamarine ${{ env.AQ_TAG }}
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "$AQ_TAG" "$AQ_REPO" aquamarine
+          HEAD_COMMIT=$(git -C aquamarine rev-parse HEAD)
+          echo "aquamarine $AQ_TAG is $HEAD_COMMIT"
+          if [ "$HEAD_COMMIT" != "$AQ_COMMIT" ]; then
+            echo "::error::tag $AQ_TAG points to $HEAD_COMMIT, expected $AQ_COMMIT"
+            exit 1
+          fi
+
+      - name: Apply the wl_shm patch
+        run: |
+          set -euxo pipefail
+          PATCH="$GITHUB_WORKSPACE/aquamarine-shm/patches/0001-wayland-wl_shm-presentation-fallback.patch"
+          sha256sum "$PATCH"
+          git -C aquamarine apply --check --verbose "$PATCH"
+          git -C aquamarine apply "$PATCH"
+          git -C aquamarine status --short
+
+      - name: Configure
+        run: |
+          set -euxo pipefail
+          cmake -S aquamarine -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Install to a staging directory
+        run: |
+          set -euxo pipefail
+          DESTDIR="$GITHUB_WORKSPACE/stage" cmake --install build
+          find stage -printf '%M %10s %p %l\n' | sort -k3
+
+      - name: Check the library
+        run: |
+          set -euo pipefail
+          LIB="stage$PREFIX/lib/libaquamarine.so.14"
+          test -e "$LIB"
+          SONAME=$(readelf -d "$LIB" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')
+          echo "SONAME: $SONAME"
+          if [ "$SONAME" != "libaquamarine.so.14" ]; then
+            echo "::error::unexpected soname $SONAME"
+            exit 1
+          fi
+          NEEDED=$(readelf -d "$LIB" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | tr '\n' ' ' | sed 's/ $//')
+          echo "NEEDED: $NEEDED"
+          if [ "$NEEDED" != "$(echo $EXPECTED_NEEDED)" ]; then
+            echo "::error::NEEDED differs from the stock libaquamarine.so.14 on the target (expected: $(echo $EXPECTED_NEEDED)). The mirror has moved on: this artifact would not load next to the target's Hyprland, or would load a second hyprutils."
+            exit 1
+          fi
+          # newest version of symbol set $1 (GLIBC, GLIBCXX, CXXABI) the library needs, e.g. 2.38
+          newest() { objdump -T "$LIB" | { grep -o "$1_[0-9][0-9.]*" || true; } | sed "s/^$1_//" | sort -uV | tail -1; }
+          # fails the build if set $1 is needed in version $2, newer than the target's $3
+          check_max() {
+            if [ -n "$2" ] && [ "$(printf '%s\n%s\n' "$2" "$3" | sort -V | tail -1)" != "$3" ]; then
+              echo "::error::the library needs $1_$2, the target only has up to $1_$3"
+              exit 1
+            fi
+          }
+          GLIBC=$(newest GLIBC)
+          GLIBCXX=$(newest GLIBCXX)
+          CXXABI=$(newest CXXABI)
+          echo "newest symbol versions needed: GLIBC_$GLIBC GLIBCXX_$GLIBCXX CXXABI_$CXXABI"
+          check_max GLIBC "$GLIBC" "$TARGET_GLIBC_MAX"
+          check_max GLIBCXX "$GLIBCXX" "$TARGET_GLIBCXX_MAX"
+          check_max CXXABI "$CXXABI" "$TARGET_CXXABI_MAX"
+          echo "::notice::soname $SONAME, NEEDED as on the target, needs GLIBC_$GLIBC GLIBCXX_$GLIBCXX CXXABI_$CXXABI"
+          # the patch must add the wl_shm path to the Wayland backend
+          nm -DC "$LIB" > build/exports.txt
+          if ! grep -q 'CWaylandOutput::presentShm' build/exports.txt; then
+            echo "::error::presentShm not found in the library"
+            exit 1
+          fi
+
+      - name: Run the CPU-only copy test
+        run: |
+          set -euxo pipefail
+          g++ -std=c++23 -O2 -Wall -Wextra \
+            -I aquamarine/src/backend -I /usr/include/pixman-1 \
+            aquamarine-shm/tests/shm_copy_test.cpp -lhyprutils -lpixman-1 -o build/shm_copy_test
+          ./build/shm_copy_test
+
+      - name: Package
+        run: |
+          set -euxo pipefail
+          OUT=aquamarine-shm-0.15.1-aarch64
+          # BSD-3-Clause: binary redistributions carry the notices
+          install -Dm644 aquamarine/LICENSE "stage$PREFIX/share/licenses/aquamarine/LICENSE"
+          install -Dm644 aquamarine-shm/LICENSE "stage$PREFIX/share/licenses/aquamarine-omalauncher/LICENSE"
+          {
+            echo "aquamarine $AQ_TAG ($(git -C aquamarine rev-parse HEAD)) + wl_shm presentation patch"
+            echo "drop-in for: hyprland 0.56.2 + aquamarine 0.15.1 (libaquamarine.so.14) + hyprutils with libhyprutils.so.13"
+            echo "patch sha256: $(sha256sum aquamarine-shm/patches/0001-wayland-wl_shm-presentation-fallback.patch | cut -d' ' -f1)"
+            echo "built by: $GITHUB_REPOSITORY@$GITHUB_SHA, run $GITHUB_RUN_ID"
+            echo "built against:"
+            pacman -Q glibc gcc hyprutils wayland libdrm mesa libinput seatd libdisplay-info pixman | sed 's/^/  /'
+            echo "NEEDED:"
+            readelf -d "stage$PREFIX/lib/libaquamarine.so.14" | sed -n 's/.*Shared library: \[\(.*\)\]/  \1/p'
+            echo "newest symbol versions: $(objdump -T "stage$PREFIX/lib/libaquamarine.so.14" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1) $(objdump -T "stage$PREFIX/lib/libaquamarine.so.14" | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -1)"
+          } > "stage$PREFIX/BUILDINFO.txt"
+          cat "stage$PREFIX/BUILDINFO.txt"
+          tar -C stage -czf "$OUT.tar.gz" "${PREFIX#/}"
+          sha256sum "$OUT.tar.gz" | tee "$OUT.tar.gz.sha256"
+          tar -tzvf "$OUT.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aquamarine-shm-0.15.1-aarch64
+          path: |
+            aquamarine-shm-0.15.1-aarch64.tar.gz
+            aquamarine-shm-0.15.1-aarch64.tar.gz.sha256
+          if-no-files-found: error

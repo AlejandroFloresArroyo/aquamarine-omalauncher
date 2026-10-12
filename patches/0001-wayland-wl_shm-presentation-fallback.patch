@@ -1,0 +1,1238 @@
+wayland: present through wl_shm when the host has no zwp_linux_dmabuf_v1
+
+Applies to aquamarine v0.15.1 (f31c47a1b9d300847d8fc3108ad959448103dfc1) with
+`git apply` at the repo root.
+
+Without zwp_linux_dmabuf_v1 the Wayland backend used to refuse to start
+("Missing protocols"), leaving no DRM fd and no allocator. With this patch it
+falls back to wl_shm presentation ("wl_shm mode"):
+
+- start(): the dmabuf requirement is dropped. Without a usable
+  zwp_linux_dmabuf_v1 (or with AQ_WAYLAND_SHM_PRESENT=1) the backend opens the
+  render node AQ_WAYLAND_RENDER_NODE (default /dev/dri/renderD128; render
+  nodes only). That fd feeds the GBM allocator and the consumer's renderer as
+  before.
+- Render formats become XRGB8888 and ARGB8888 with DRM_FORMAT_MOD_LINEAR only,
+  so the CPU can read the buffers. GBM allocates them with RENDERING only
+  (no SCANOUT) in this mode.
+- commit() never blocks on the GPU. The frame becomes pending and stays in
+  flight (no frame event, no rendering into the swapchain) until it reaches
+  the host. Its explicit in-fence is dup'ed into an epoll set whose fd is one
+  of pollFDs(); when it signals, only the damaged rectangles are copied
+  (gbm_bo_map by default, or a dmabuf mmap bracketed by DMA_BUF_IOCTL_SYNC
+  with AQ_WAYLAND_SHM_MMAP=1) into one of at most 3 memfd wl_shm buffers,
+  which is attached with wl_surface.damage for exactly what changed. Buffers
+  the host still holds are never written; a frame waits for a
+  wl_buffer.release instead. No fence or syncobj is ever created or exported.
+- A commit without changes re-attaches an up-to-date buffer with one pixel of
+  damage, so the host always gets a normal buffer commit and answers its
+  frame callback. No commit is sent without an attach.
+- Frames without a fence are copied after DMA_BUF_IOCTL_SYNC(START|READ) and
+  the copied pixels are read again 25 ms later (a timerfd in the same epoll
+  set), or with the next frame if it comes first.
+- test() rejects buffers that are not this backend's LINEAR swapchain buffers,
+  so a consumer's direct scanout of client buffers never engages.
+- No hardware cursor in wl_shm mode (capabilities() = 0). The consumer draws
+  the cursor and the host's pointer image is hidden on enter.
+- In wl_shm mode, xdg_toplevel.configure is applied after its
+  xdg_surface.configure is acked, so no buffer reaches an unconfigured surface.
+- No dmabuf proxy is dereferenced when the host lacks the global (setCursor,
+  CWaylandBuffer).
+- GBM: drmGetDeviceNameFromFd2() may return NULL (no uevent in sysfs). It was
+  assigned to a std::string unchecked.
+
+With a working zwp_linux_dmabuf_v1 and AQ_WAYLAND_SHM_PRESENT unset,
+behaviour is unchanged. The only exception is the NULL check above.
+
+New environment variables are documented in docs/env.md.
+
+diff --git a/docs/env.md b/docs/env.md
+index b496edb..50a1108 100644
+--- a/docs/env.md
++++ b/docs/env.md
+@@ -16,3 +16,11 @@ Unless specified otherwise, a variable is enabled if and only if it's set to `1`
+ ### Debugging
+ 
+ `AQ_TRACE` -> Enables trace (very verbose) logging
++
++### Wayland
++
++`AQ_WAYLAND_SHM_PRESENT` -> Present output frames to the host compositor as wl_shm copies. Used automatically when the host has no (working) `zwp_linux_dmabuf_v1`; `1` forces it, `0` disables it.
++`AQ_WAYLAND_RENDER_NODE` -> In wl_shm mode, the DRM render node to allocate and render on. Default `/dev/dri/renderD128`. Only render nodes are accepted.
++`AQ_WAYLAND_SHM_MMAP` -> In wl_shm mode, `1` reads rendered buffers through a direct mmap of the dmabuf instead of `gbm_bo_map` (the default).
++`AQ_WAYLAND_SHM_DMABUF_SYNC` -> In wl_shm mode, bracket reads with `DMA_BUF_IOCTL_SYNC`: unset for frames without a fence, re-copies and direct mmap reads; `1` always; `0` never.
++`AQ_WAYLAND_SHM_RECOPY` -> In wl_shm mode, read pixels again one host frame later: unset only for frames without a fence; `1` every frame; `0` never.
+diff --git a/include/aquamarine/backend/Wayland.hpp b/include/aquamarine/backend/Wayland.hpp
+index 8793d4e..1cd7d57 100644
+--- a/include/aquamarine/backend/Wayland.hpp
++++ b/include/aquamarine/backend/Wayland.hpp
+@@ -66,6 +66,74 @@ namespace Aquamarine {
+         void                                              onFrameDone();
+         void                                              onEnter(Hyprutils::Memory::CSharedPointer<CCWlPointer> pointer, uint32_t serial);
+ 
++        // wl_shm presentation, used when the host has no zwp_linux_dmabuf_v1 (see Wayland.cpp and src/backend/WaylandShm.hpp)
++        struct SShmBuffer {
++            ~SShmBuffer();
++            Hyprutils::Memory::CSharedPointer<CCWlShmPool> pool; // one pool per buffer, destroyed together with it
++            Hyprutils::Memory::CSharedPointer<CCWlBuffer>  buffer;
++            uint8_t*                                       data   = nullptr; // our mapping of the pool
++            size_t                                         size   = 0;
++            uint32_t                                       stride = 0;
++            Hyprutils::Math::CRegion                       stale;            // pixels older than the newest frame
++            bool                                           busy    = false;  // attached, no wl_buffer.release yet
++            uint64_t                                       syncSeq = 0;      // when it was last brought up to date (0: never)
++        };
++
++        // read-only CPU mapping of a swapchain buffer, kept for the buffer's lifetime (AQ_WAYLAND_SHM_MMAP=1 only)
++        struct SShmSource {
++            ~SShmSource();
++            Hyprutils::Memory::CWeakPointer<IBuffer> buffer;
++            uint8_t*                                 data = nullptr; // nullptr: no direct mapping, read through gbm_bo_map
++            size_t                                   size = 0;
++        };
++
++        // The newest rendered frame (or a re-copy, see recopyUnverifiedShm), waiting until its GPU
++        // fence has signaled and a wl_shm buffer is free. Only then is it copied, attached and committed.
++        struct SShmPending {
++            Hyprutils::Memory::CSharedPointer<IBuffer> source;
++            SDMABUFAttrs                               attrs;
++            Hyprutils::OS::CFileDescriptor             fence;           // our dup of the frame's explicit in-fence; invalid: the frame had none
++            bool                                       frame   = true;  // a consumer frame, which owns the frame in flight (false: a re-copy)
++            bool                                       watched = false; // fence is in the backend's epoll set
++            bool                                       warned  = false; // slow fence already logged
++            std::chrono::steady_clock::time_point      since;
++        };
++
++        bool                                          presentShm(const COutputState::SInternalState& STATE);
++        void                                          advanceShm();
++        void                                          forgetShmPending();
++        void                                          dropShmPending(bool rerender);
++        void                                          recopyUnverifiedShm();
++        void                                          armShmRecopy();
++        void                                          onShmRecopyTimer();
++        void                                          closeShmRecopyTimer();
++        void                                          checkShmFenceAge();
++        bool                                          shmCanRead(Hyprutils::Memory::CSharedPointer<IBuffer> buffer, const SDMABUFAttrs& attrs);
++        bool                                          copyToShm(const SShmPending& pending, SShmBuffer& dst, const std::vector<pixman_box32_t>& rects);
++        Hyprutils::Memory::CSharedPointer<SShmBuffer> createShmBuffer(const Hyprutils::Math::Vector2D& size, uint32_t format);
++        Hyprutils::Memory::CSharedPointer<SShmSource> shmSourceFor(Hyprutils::Memory::CSharedPointer<IBuffer> buffer, const SDMABUFAttrs& attrs);
++
++        struct {
++            std::vector<Hyprutils::Memory::CSharedPointer<SShmBuffer>> buffers;
++            std::vector<Hyprutils::Memory::CSharedPointer<SShmSource>> sources;
++            Hyprutils::Math::CRegion                                   hostDamage; // changed since the host last copied from us
++            Hyprutils::Math::Vector2D                                  size;
++            uint32_t                                                   format     = 0;
++            uint64_t                                                   seq        = 0;
++            bool                                                       configured = false; // first xdg_surface.configure acked
++            bool                                                       presented  = false; // a buffer has been attached
++            std::optional<SShmPending>                                 pending;
++            // pixels copied without a signaled fence (the frame had none): copied again from the same
++            // source buffer when recopyTimer fires (a couple of host frames later), or with the next
++            // frame, whichever comes first
++            Hyprutils::Math::CRegion                   unverified;
++            Hyprutils::Memory::CSharedPointer<IBuffer> unverifiedSource;
++            SDMABUFAttrs                               unverifiedAttrs;
++            Hyprutils::OS::CFileDescriptor             recopyTimer; // timerfd in the backend's epoll set
++            size_t                                     framesWithoutFence = 0;
++            std::optional<Hyprutils::Math::Vector2D>   pendingConfigure; // xdg_toplevel size, applied after the ack
++        } shmState;
++
+         // frame loop — unified scheduler shared with DRM. See CFrameScheduler.
+         CFrameScheduler                                              sched;
+         Hyprutils::Signal::CHyprSignalListener                       frameReadyListener;
+@@ -147,12 +215,19 @@ namespace Aquamarine {
+         Hyprutils::Memory::CWeakPointer<CWaylandBackend>                   self;
+         virtual int                                                        drmRenderNodeFD();
+ 
++        // true if output frames reach the host as wl_shm copies instead of dmabufs
++        bool shmPresentation() const;
++
+       private:
+         CWaylandBackend(Hyprutils::Memory::CSharedPointer<CBackend> backend);
+ 
+         void initSeat();
+         void initShell();
+         bool initDmabuf();
++        bool initShmPresentation(const std::string& reason);
++        bool watchShmFD(int fd, uint32_t events, bool modify);
++        void unwatchShmFD(int fd);
++        void dispatchShmFDs();
+ 
+         //
+         Hyprutils::Memory::CWeakPointer<CBackend>                        backend;
+@@ -192,6 +267,16 @@ namespace Aquamarine {
+             std::string nodeName = "";
+         } drmState;
+ 
++        // wl_shm presentation (host without zwp_linux_dmabuf_v1, or AQ_WAYLAND_SHM_PRESENT=1)
++        struct {
++            bool                           enabled = false;
++            std::vector<SDRMFormat>        formats;             // LINEAR XRGB8888 / ARGB8888, so the CPU can read the buffers
++            int                            dmabufSync  = -1;    // AQ_WAYLAND_SHM_DMABUF_SYNC: -1 auto (see copyToShm), 0 never, 1 always
++            bool                           mmapSources = false; // AQ_WAYLAND_SHM_MMAP=1: read through a direct mmap of the dmabuf, not gbm_bo_map
++            int                            recopy      = -1;    // AQ_WAYLAND_SHM_RECOPY: -1 frames without a fence, 0 never, 1 every frame
++            Hyprutils::OS::CFileDescriptor epollFD;             // fences of pending frames and re-copy timers, polled by the consumer
++        } shmPresent;
++
+         friend class CBackend;
+         friend class CWaylandKeyboard;
+         friend class CWaylandPointer;
+diff --git a/src/allocator/GBM.cpp b/src/allocator/GBM.cpp
+index 6f596b7..bd2b4bd 100644
+--- a/src/allocator/GBM.cpp
++++ b/src/allocator/GBM.cpp
+@@ -2,6 +2,7 @@
+ #include <aquamarine/allocator/GBM.hpp>
+ #include <aquamarine/backend/Backend.hpp>
+ #include <aquamarine/backend/DRM.hpp>
++#include <aquamarine/backend/Wayland.hpp>
+ #include <aquamarine/allocator/Swapchain.hpp>
+ #include "FormatUtils.hpp"
+ #include "Shared.hpp"
+@@ -162,8 +163,13 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
+         explicitModifiers = {DRM_FORMAT_MOD_LINEAR};
+     }
+ 
+-    uint32_t flags = GBM_BO_USE_RENDERING;
+-    if (params.scanout && !MULTIGPU)
++    // In the Wayland backend's wl_shm mode the GPU renders into these buffers and the CPU reads
++    // them back; they are never scanned out. LINEAR with RENDERING only is the combination known
++    // to work there (zink); SCANOUT could make a driver pick memory the CPU can't map, or fail.
++    const bool WL_SHM = swapchain->backendImpl->type() == AQ_BACKEND_WAYLAND && ((CWaylandBackend*)swapchain->backendImpl.get())->shmPresentation();
++
++    uint32_t   flags = GBM_BO_USE_RENDERING;
++    if (params.scanout && !MULTIGPU && !WL_SHM)
+         flags |= GBM_BO_USE_SCANOUT;
+ 
+     uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+@@ -357,7 +363,7 @@ Aquamarine::CGBMAllocator::CGBMAllocator(int fd_, Hyprutils::Memory::CWeakPointe
+ 
+     gbmDeviceBackendName = gbm_device_get_backend_name(gbmDevice);
+     auto drmName_        = drmGetDeviceNameFromFd2(fd_);
+-    drmName              = drmName_;
++    drmName              = drmName_ ? drmName_ : ""; // NULL if sysfs has no uevent for the node (e.g. a fake /sys in proot)
+     free(drmName_);
+ }
+ 
+diff --git a/src/backend/Wayland.cpp b/src/backend/Wayland.cpp
+index 8905adc..bae0330 100644
+--- a/src/backend/Wayland.cpp
++++ b/src/backend/Wayland.cpp
+@@ -1,15 +1,24 @@
+ #include <algorithm>
+ #include <aquamarine/backend/Wayland.hpp>
++#include <aquamarine/allocator/GBM.hpp>
+ #include <wayland.hpp>
+ #include <xdg-shell.hpp>
+ #include "Shared.hpp"
+ #include "FormatUtils.hpp"
++#include "WaylandShm.hpp"
+ #include <chrono>
+ #include <cstring>
+ #include <xf86drm.h>
+ #include <gbm.h>
+ #include <fcntl.h>
++#include <poll.h>
++#include <sys/epoll.h>
++#include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#include <sys/timerfd.h>
++#include <linux/dma-buf.h>
+ #include <unistd.h>
+ 
+ using namespace Aquamarine;
+@@ -144,7 +153,18 @@ bool Aquamarine::CWaylandBackend::start() {
+ 
+     wl_display_roundtrip(waylandState.display);
+ 
+-    if (!waylandState.xdg || !waylandState.compositor || !waylandState.seat || !waylandState.dmabuf || waylandState.dmabufFailed || !waylandState.shm) {
++    if (!waylandState.xdg || !waylandState.compositor || !waylandState.seat || !waylandState.shm) {
++        backend->log(AQ_LOG_ERROR, "Wayland backend cannot start: Missing protocols");
++        return false;
++    }
++
++    // A host without (working) zwp_linux_dmabuf_v1 cannot take our GPU buffers: present through
++    // wl_shm copies instead. AQ_WAYLAND_SHM_PRESENT=1 forces that path, =0 disables it.
++    const bool DMABUF_OK = waylandState.dmabuf && !waylandState.dmabufFailed;
++    if (envEnabled("AQ_WAYLAND_SHM_PRESENT") || (!DMABUF_OK && !envExplicitlyDisabled("AQ_WAYLAND_SHM_PRESENT"))) {
++        if (!initShmPresentation(DMABUF_OK ? "forced by AQ_WAYLAND_SHM_PRESENT=1" : "the host has no usable zwp_linux_dmabuf_v1"))
++            return false;
++    } else if (!DMABUF_OK) {
+         backend->log(AQ_LOG_ERROR, "Wayland backend cannot start: Missing protocols");
+         return false;
+     }
+@@ -190,7 +210,14 @@ std::vector<Hyprutils::Memory::CSharedPointer<SPollFD>> Aquamarine::CWaylandBack
+     if (!waylandState.display)
+         return {};
+ 
+-    return {makeShared<SPollFD>(wl_display_get_fd(waylandState.display), [this]() { dispatchEvents(); })};
++    std::vector<SP<SPollFD>> fds = {makeShared<SPollFD>(wl_display_get_fd(waylandState.display), [this]() { dispatchEvents(); })};
++
++    // wl_shm mode: becomes readable when the GPU fence of a frame waiting to be copied signals, or
++    // when it is time to re-copy pixels read without a fence
++    if (shmPresent.epollFD.isValid())
++        fds.emplace_back(makeShared<SPollFD>(shmPresent.epollFD.get(), [this]() { dispatchShmFDs(); }));
++
++    return fds;
+ }
+ 
+ bool Aquamarine::CWaylandBackend::dispatchEvents() {
+@@ -216,10 +243,22 @@ bool Aquamarine::CWaylandBackend::dispatchEvents() {
+         idleCallbacks.clear();
+     }
+ 
++    if (shmPresent.enabled) {
++        for (auto const& o : outputs) {
++            o->checkShmFenceAge();
++        }
++    }
++
+     return true;
+ }
+ 
+ uint32_t Aquamarine::CWaylandBackend::capabilities() {
++    // wl_shm mode has no hardware cursor: cursor buffers are rendered on the GPU without a fence
++    // we could wait on before reading them, so the consumer draws the cursor into its frames
++    // instead (Hyprland: software cursor). onEnter() hides the host's pointer image.
++    if (shmPresent.enabled)
++        return 0;
++
+     return AQ_BACKEND_CAPABILITY_POINTER;
+ }
+ 
+@@ -469,13 +508,112 @@ bool Aquamarine::CWaylandBackend::initDmabuf() {
+ }
+ 
+ std::vector<SDRMFormat> Aquamarine::CWaylandBackend::getRenderFormats() {
++    if (shmPresent.enabled)
++        return shmPresent.formats;
++
+     return dmabufFormats;
+ }
+ 
+ std::vector<SDRMFormat> Aquamarine::CWaylandBackend::getCursorFormats() {
++    if (shmPresent.enabled)
++        return {}; // no hardware cursor, see capabilities()
++
+     return dmabufFormats;
+ }
+ 
++bool Aquamarine::CWaylandBackend::shmPresentation() const {
++    return shmPresent.enabled;
++}
++
++bool Aquamarine::CWaylandBackend::initShmPresentation(const std::string& reason) {
++    // The render node for the GBM allocator and for the consumer's renderer (via drmFD()). On a
++    // dmabuf host (forced mode) keep its main device unless AQ_WAYLAND_RENDER_NODE says otherwise.
++    const char* envNode = getenv("AQ_WAYLAND_RENDER_NODE");
++    if (drmState.fd < 0 || (envNode && *envNode)) {
++        const std::string NODE = envNode && *envNode ? envNode : "/dev/dri/renderD128";
++
++        // Only ever open render nodes (DRM char major 226, minor >= 128): primary nodes
++        // (/dev/dri/card*) may drive the real display, e.g. Android's on phones.
++        struct stat st;
++        if (stat(NODE.c_str(), &st) != 0 || !S_ISCHR(st.st_mode) || major(st.st_rdev) != 226 || minor(st.st_rdev) < 128) {
++            backend->log(AQ_LOG_ERROR, std::format("Wayland backend cannot start: {} is not a DRM render node (see AQ_WAYLAND_RENDER_NODE)", NODE));
++            return false;
++        }
++
++        const int FD = open(NODE.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
++        if (FD < 0) {
++            backend->log(AQ_LOG_ERROR, std::format("Wayland backend cannot start: failed to open render node {}: {}", NODE, strerror(errno)));
++            return false;
++        }
++
++        if (drmState.fd >= 0)
++            close(drmState.fd);
++
++        drmState.fd       = FD;
++        drmState.nodeName = NODE;
++    }
++
++    // The CPU reads these buffers, so their layout must be known: LINEAR only, and only formats
++    // whose wl_shm twins have the same byte layout (wl_shm XRGB8888/ARGB8888 = DRM XRGB8888/ARGB8888).
++    shmPresent.formats = {
++        SDRMFormat{.drmFormat = DRM_FORMAT_XRGB8888, .modifiers = {DRM_FORMAT_MOD_LINEAR}},
++        SDRMFormat{.drmFormat = DRM_FORMAT_ARGB8888, .modifiers = {DRM_FORMAT_MOD_LINEAR}},
++    };
++    const auto TRISTATE = [](const char* name) { return envEnabled(name) ? 1 : (envExplicitlyDisabled(name) ? 0 : -1); };
++    shmPresent.dmabufSync  = TRISTATE("AQ_WAYLAND_SHM_DMABUF_SYNC");
++    shmPresent.recopy      = TRISTATE("AQ_WAYLAND_SHM_RECOPY");
++    shmPresent.mmapSources = envEnabled("AQ_WAYLAND_SHM_MMAP"); // opt-in: gbm_bo_map is the path verified on real hardware
++    shmPresent.enabled     = true;
++
++    // Frames wait for their GPU fence without blocking the consumer: the fence goes into this epoll
++    // set, whose fd the consumer polls with the others (pollFDs()). Without it, commit() blocks.
++    shmPresent.epollFD = Hyprutils::OS::CFileDescriptor{epoll_create1(EPOLL_CLOEXEC)};
++    if (!shmPresent.epollFD.isValid())
++        backend->log(AQ_LOG_WARNING, std::format("Wayland backend: epoll_create1 failed ({}), wl_shm frames will wait for the GPU synchronously", strerror(errno)));
++
++    backend->log(AQ_LOG_WARNING,
++                 std::format("Wayland backend: presenting through wl_shm copies ({}). Rendering on {}, buffers LINEAR XRGB8888/ARGB8888, no hardware cursor, reading "
++                             "through {}",
++                             reason, drmState.nodeName, shmPresent.mmapSources ? "mmap of the dmabuf (AQ_WAYLAND_SHM_MMAP=1)" : "gbm_bo_map"));
++    return true;
++}
++
++bool Aquamarine::CWaylandBackend::watchShmFD(int fd, uint32_t events, bool modify) {
++    if (!shmPresent.epollFD.isValid())
++        return false;
++
++    epoll_event ev = {.events = events, .data = {.fd = fd}};
++    if (epoll_ctl(shmPresent.epollFD.get(), modify ? EPOLL_CTL_MOD : EPOLL_CTL_ADD, fd, &ev) == 0)
++        return true;
++
++    backend->log(AQ_LOG_WARNING, std::format("Wayland backend: epoll_ctl failed for a wl_shm fd: {}", strerror(errno)));
++    return false;
++}
++
++void Aquamarine::CWaylandBackend::unwatchShmFD(int fd) {
++    // explicit removal: for a fence, the consumer holds other fds of the same sync_file, so closing
++    // ours would not take it out of the epoll set
++    if (shmPresent.epollFD.isValid())
++        epoll_ctl(shmPresent.epollFD.get(), EPOLL_CTL_DEL, fd, nullptr);
++}
++
++void Aquamarine::CWaylandBackend::dispatchShmFDs() {
++    // drain the ready list (fences are one-shot; timers are read below), then let each output look
++    // at its own fence and timer
++    epoll_event events[8];
++    for (int i = 0; i < 16; ++i) {
++        const int N = epoll_wait(shmPresent.epollFD.get(), events, 8, 0);
++        if (N < 8 && !(N < 0 && errno == EINTR))
++            break;
++    }
++
++    auto outs = outputs; // neither call changes the list, but stay safe
++    for (auto const& o : outs) {
++        o->onShmRecopyTimer();
++        o->advanceShm();
++    }
++}
++
+ SP<IAllocator> Aquamarine::CWaylandBackend::preferredAllocator() {
+     return backend->primaryAllocator;
+ }
+@@ -526,6 +664,22 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
+     waylandState.xdgSurface->setConfigure([this](CCXdgSurface* r, uint32_t serial) {
+         backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: configure surface with {}", name, serial));
+         r->sendAckConfigure(serial);
++
++        if (!backend->shmPresent.enabled)
++            return;
++
++        // wl_shm mode: apply the toplevel configure only now that it is acked, so the frame the
++        // consumer renders in response is never attached to an unconfigured xdg_surface
++        // (xdg_surface.unconfigured_buffer). Still within the same dispatch.
++        shmState.configured = true;
++        if (!shmState.pendingConfigure)
++            return;
++
++        const auto SIZE = *shmState.pendingConfigure;
++        shmState.pendingConfigure.reset();
++        events.state.emit(SStateEvent{.size = SIZE});
++        needsFrame = true;
++        sched.frameReady.emit();
+     });
+ 
+     waylandState.xdgToplevel = makeShared<CCXdgToplevel>(waylandState.xdgSurface->sendGetToplevel());
+@@ -545,6 +699,12 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
+             w = 1280;
+             h = 720;
+         }
++
++        if (backend->shmPresent.enabled) {
++            shmState.pendingConfigure = Vector2D{w, h}; // applied by xdg_surface.configure, after the ack
++            return;
++        }
++
+         events.state.emit(SStateEvent{.size = {w, h}});
+         // Kick off the first frame synchronously: the consumer expects events.frame in
+         // the same dispatch cycle as the toplevel configure. Deferring via scheduleFrame's
+@@ -574,6 +734,8 @@ Aquamarine::CWaylandOutput::~CWaylandOutput() {
+     events.destroy.emit();
+     // frameIdle captures a raw this and may still be queued; pull it before we die.
+     backend->backend->removeIdleEvent(frameIdle);
++    forgetShmPending(); // takes its fence out of the backend's epoll set
++    closeShmRecopyTimer();
+     if (waylandState.xdgToplevel)
+         waylandState.xdgToplevel->sendDestroy();
+     if (waylandState.xdgSurface)
+@@ -602,6 +764,8 @@ bool Aquamarine::CWaylandOutput::destroy() {
+         backend->focusedOutput = {};
+ 
+     events.destroy.emit();
++    forgetShmPending();
++    closeShmRecopyTimer();
+     waylandState.surface->sendAttach(nullptr, 0, 0);
+     waylandState.surface->sendCommit();
+     waylandState.frameCallback.reset();
+@@ -611,7 +775,22 @@ bool Aquamarine::CWaylandOutput::destroy() {
+ }
+ 
+ bool Aquamarine::CWaylandOutput::test() {
+-    return true; // TODO:
++    if (!backend->shmPresent.enabled)
++        return true; // TODO:
++
++    // wl_shm mode reads every presented buffer with the CPU, so only accept buffers it can read and
++    // knows when the GPU is done with: our own LINEAR swapchain buffers. This rejects client buffers
++    // a consumer wants to scan out directly (Hyprland's direct scanout), which would be read with
++    // no fence, and keeps such a consumer on its normal composited path.
++    const auto& STATE = state->state();
++    if (!(STATE.committed & COutputState::AQ_OUTPUT_STATE_BUFFER) || !STATE.buffer)
++        return true;
++
++    if (shmCanRead(STATE.buffer, STATE.buffer->dmabuf()))
++        return true;
++
++    TRACE(backend->backend->log(AQ_LOG_TRACE, std::format("Output {}: wl_shm: test rejects a buffer that is not one of ours", name)));
++    return false;
+ }
+ 
+ bool Aquamarine::CWaylandOutput::commit() {
+@@ -657,6 +836,21 @@ bool Aquamarine::CWaylandOutput::commit() {
+         return true;
+     }
+ 
++    if (backend->shmPresent.enabled) {
++        // The host can't take dmabufs: copy what changed into a wl_shm buffer and attach that.
++        // needsFrame is cleared first because presentShm may ask for another frame.
++        const bool NEEDED = needsFrame;
++        needsFrame        = false;
++        if (!presentShm(STATE)) {
++            needsFrame = NEEDED;
++            return false;
++        }
++
++        events.commit.emit();
++        state->consume(snapshot);
++        return true;
++    }
++
+     auto wlBuffer = wlBufferFromBuffer(STATE.buffer);
+ 
+     if (!wlBuffer) {
+@@ -734,6 +928,21 @@ void Aquamarine::CWaylandOutput::onFrameDone() {
+     // commit (its needsFrame bit clears in renderMonitor), no new wl_surface.frame
+     // is registered (registration lives in commit()), so no further done arrives.
+     waylandState.frameCallback.reset();
++
++    if (backend->shmPresent.enabled) {
++        if (shmState.pending && shmState.pending->frame) {
++            // wl_shm mode: a newer frame still waits for its fence or a free buffer. It owns the frame
++            // in flight and requests the next wl_surface.frame when it reaches the host.
++            CFrameRunningGuard frameRunning(sched);
++            events.present.emit(IOutput::SPresentEvent{.presented = true});
++            return;
++        }
++
++        // without the re-copy timer (no epoll): re-copy now, before the consumer renders again
++        if (!shmState.recopyTimer.isValid())
++            recopyUnverifiedShm();
++    }
++
+     sched.onFrameComplete();
+ 
+     CFrameRunningGuard frameRunning(sched);
+@@ -760,6 +969,12 @@ bool Aquamarine::CWaylandOutput::setCursor(Hyprutils::Memory::CSharedPointer<IBu
+         return true;
+     }
+ 
++    if (!backend->waylandState.dmabuf && !buffer->shm().success) {
++        // host without zwp_linux_dmabuf_v1: there is no way to hand it a dmabuf cursor
++        backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: cannot set a dmabuf cursor, the host has no zwp_linux_dmabuf_v1", name));
++        return false;
++    }
++
+     cursorState.cursorBuffer = buffer;
+     cursorState.hotspot      = hotspot;
+ 
+@@ -833,8 +1048,13 @@ void Aquamarine::CWaylandOutput::moveCursor(const Hyprutils::Math::Vector2D& coo
+ void Aquamarine::CWaylandOutput::onEnter(SP<CCWlPointer> pointer, uint32_t serial) {
+     cursorState.serial = serial;
+ 
+-    if (!cursorState.cursorSurface)
++    if (!cursorState.cursorSurface) {
++        // wl_shm mode: the consumer draws the cursor into its frames (no hardware cursor, see
++        // capabilities()), so hide the host's pointer image over our surface.
++        if (backend->shmPresent.enabled)
++            pointer->sendSetCursor(serial, nullptr, 0, 0);
+         return;
++    }
+ 
+     pointer->sendSetCursor(serial, cursorState.cursorSurface.get(), cursorState.hotspot.x, cursorState.hotspot.y);
+ }
+@@ -862,6 +1082,11 @@ void Aquamarine::CWaylandOutput::scheduleFrame(const scheduleFrameReason reason)
+ }
+ 
+ Aquamarine::CWaylandBuffer::CWaylandBuffer(SP<IBuffer> buffer_, Hyprutils::Memory::CWeakPointer<CWaylandBackend> backend_) : buffer(buffer_), backend(backend_) {
++    if (!backend->waylandState.dmabuf) {
++        backend->backend->log(AQ_LOG_ERROR, "WaylandBuffer: the host has no zwp_linux_dmabuf_v1");
++        return;
++    }
++
+     auto params = makeShared<CCZwpLinuxBufferParamsV1>(backend->waylandState.dmabuf->sendCreateParams());
+ 
+     if (!params) {
+@@ -890,3 +1115,555 @@ Aquamarine::CWaylandBuffer::~CWaylandBuffer() {
+ bool Aquamarine::CWaylandBuffer::good() {
+     return waylandState.buffer && waylandState.buffer->resource();
+ }
++
++// -------------------------------------------------------------------------------------------------
++// wl_shm presentation
++//
++// Used when the host has no zwp_linux_dmabuf_v1 (or with AQ_WAYLAND_SHM_PRESENT=1). The consumer
++// still renders on the GPU, into our GBM swapchain buffers (LINEAR, see initShmPresentation).
++//
++// commit() records what the frame changed and makes it the pending frame (presentShm). advanceShm()
++// copies the changed pixels into a wl_shm buffer, attaches that and commits, once
++//  - the frame's GPU fence has signaled. Nothing blocks on it: the fence goes into the backend's
++//    epoll set, whose fd the consumer polls with the others, and dispatchShmFDs() continues;
++//  - a wl_shm buffer is free. Otherwise the next wl_buffer.release continues.
++// Until the commit's wl_surface.frame is done the frame stays in flight, so the consumer gets no
++// frame event and does not render into its swapchain again. A newer frame replaces a pending one:
++// it is complete wherever the old one was, and the old one's damage stays recorded.
++// A frame without a fence is copied right away, after DMA_BUF_IOCTL_SYNC; what it copied is read
++// again a little later (recopyUnverifiedShm), when the GPU is surely done.
++// WaylandShm.hpp describes the damage bookkeeping.
++// -------------------------------------------------------------------------------------------------
++
++constexpr int    SHM_FENCE_TIMEOUT_MS  = 1000; // only without epoll, where commit() has to wait
++constexpr int    SHM_FENCE_SLOW_MS     = 1000; // log fences that take longer than this
++constexpr long   SHM_RECOPY_DELAY_MS   = 25;   // re-copy of pixels read without a fence: a couple of host frames (90 Hz) later
++constexpr size_t SHM_NO_FENCE_WARN_RUN = 3;    // consecutive frames without a fence before warning (a modeset has none)
++
++// Waits up to timeoutMs (0: just looks) for a sync_file: 1 signaled, 0 not yet, -1 error. An
++// interrupted wait continues with what is left of the timeout.
++static int waitForSyncFile(int fd, int timeoutMs) {
++    const auto DEADLINE = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
++    for (int i = 0; i < 64; ++i) {
++        const auto LEFT = std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(DEADLINE - std::chrono::steady_clock::now()).count());
++        pollfd     pfd  = {.fd = fd, .events = POLLIN, .revents = 0};
++        const int  RET  = poll(&pfd, 1, (int)LEFT);
++        if (RET > 0)
++            return (pfd.revents & (POLLERR | POLLNVAL)) || !(pfd.revents & POLLIN) ? -1 : 1;
++        if (RET == 0)
++            return 0;
++        if (errno != EINTR && errno != EAGAIN)
++            return -1;
++    }
++    return 0;
++}
++
++// DMA_BUF_IOCTL_SYNC: START waits for the implicit fences of writers (only those the producer
++// attached by then) and makes the CPU's view of the buffer coherent; END closes the access.
++static bool syncDmabuf(int fd, uint64_t flags) {
++    dma_buf_sync sync = {.flags = flags};
++    for (int i = 0; i < 16; ++i) {
++        if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) == 0)
++            return true;
++        if (errno != EINTR && errno != EAGAIN)
++            return false;
++    }
++    return false;
++}
++
++Aquamarine::CWaylandOutput::SShmBuffer::~SShmBuffer() {
++    buffer.reset(); // wl_buffer.destroy, then its pool
++    pool.reset();
++    if (data)
++        munmap(data, size);
++}
++
++Aquamarine::CWaylandOutput::SShmSource::~SShmSource() {
++    if (data)
++        munmap(data, size);
++}
++
++bool Aquamarine::CWaylandOutput::shmCanRead(SP<IBuffer> buffer, const SDMABUFAttrs& ATTRS) {
++    // Our own GBM buffers only, single-plane LINEAR XRGB8888/ARGB8888: the CPU knows their layout,
++    // and the consumer hands over a fence for each frame it renders into them. Not, e.g., a client
++    // buffer the consumer wants to scan out directly.
++    return buffer && dynamic_cast<CGBMBuffer*>(buffer.get()) && ATTRS.success && ATTRS.planes == 1 && ATTRS.modifier == DRM_FORMAT_MOD_LINEAR &&
++        (ATTRS.format == DRM_FORMAT_XRGB8888 || ATTRS.format == DRM_FORMAT_ARGB8888) && ATTRS.size.x >= 1 && ATTRS.size.y >= 1 && ATTRS.fds.at(0) >= 0 &&
++        ATTRS.strides.at(0) >= (uint32_t)ATTRS.size.x * 4;
++}
++
++bool Aquamarine::CWaylandOutput::presentShm(const COutputState::SInternalState& STATE) {
++    // Only commits that set a buffer carry new pixels. Others (DPMS, mode tests, ...) leave the host
++    // showing what it has.
++    if (!(STATE.committed & COutputState::AQ_OUTPUT_STATE_BUFFER))
++        return true;
++
++    const auto ATTRS = STATE.buffer->dmabuf();
++    if (!shmCanRead(STATE.buffer, ATTRS)) {
++        backend->backend->log(AQ_LOG_ERROR,
++                              std::format("Output {}: wl_shm: cannot present this buffer ({}, modifier 0x{:x}): only this backend's LINEAR XRGB8888/ARGB8888 buffers", name,
++                                          fourccToName(ATTRS.format), ATTRS.modifier));
++        return false;
++    }
++
++    const auto W = (int32_t)ATTRS.size.x, H = (int32_t)ATTRS.size.y;
++
++    // New size or format: new wl_shm buffers, and the host needs everything. Dropping the old ones is
++    // fine even if the host still holds one, since we never write to it again.
++    if (shmState.size != ATTRS.size || shmState.format != ATTRS.format) {
++        forgetShmPending(); // replaced below, together with the frame in flight it may own
++        shmState.buffers.clear();
++        shmState.size       = ATTRS.size;
++        shmState.format     = ATTRS.format;
++        shmState.hostDamage = CRegion(0, 0, W, H);
++        shmState.unverified.clear();
++        shmState.unverifiedSource.reset();
++    }
++
++    // What this frame changed, in buffer pixels. Hyprland passes its real frame damage, which may
++    // reach past the buffer. A commit without damage counts as a full change. Pixels the previous
++    // frame copied without a fence are copied again, from this newer frame.
++    CRegion damage = (STATE.committed & COutputState::AQ_OUTPUT_STATE_DAMAGE) ? STATE.damage : CRegion(0, 0, W, H);
++    damage.add(shmState.unverified);
++    damage.intersect(0, 0, W, H);
++    shmState.unverified.clear();
++    shmState.unverifiedSource.reset();
++    WaylandShm::addFrameDamage(shmState.buffers, shmState.hostDamage, damage);
++
++    // Before the first configure is acked the host must not get a buffer. Everything stays recorded
++    // and goes out with the first frame after it.
++    if (!shmState.configured)
++        return true;
++
++    // Nothing new for the host and a wl_surface.frame in flight, whose done event continues the
++    // frame loop: nothing to send. Without one, the frame goes through advanceShm(), which
++    // re-attaches an up-to-date buffer so that the host still answers with a frame callback.
++    if (shmState.hostDamage.empty() && !shmState.pending && (sched.frameInFlight() || !shmState.presented))
++        return true;
++
++    SShmPending pending = {.source = STATE.buffer, .attrs = ATTRS, .frame = true, .since = std::chrono::steady_clock::now()};
++    if ((STATE.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) && STATE.explicitInFence >= 0) {
++        // the snapshot's dup is closed when commit() returns: keep our own (just an fd dup, nothing
++        // is exported from the driver)
++        pending.fence = Hyprutils::OS::CFileDescriptor{fcntl(STATE.explicitInFence, F_DUPFD_CLOEXEC, 0)};
++        if (!pending.fence.isValid())
++            backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: wl_shm: cannot dup the frame's fence ({}), treating it as a frame without one", name, strerror(errno)));
++    }
++
++    if (pending.fence.isValid())
++        shmState.framesWithoutFence = 0;
++    else if (++shmState.framesWithoutFence == SHM_NO_FENCE_WARN_RUN) {
++        static bool warned = false;
++        if (!warned)
++            backend->backend->log(AQ_LOG_WARNING,
++                                  std::format("Output {}: wl_shm: frames arrive without an explicit fence. Presentation is not synchronized with the GPU: pixels are read "
++                                              "after DMA_BUF_IOCTL_SYNC, which only waits for fences the driver attached to the buffer, and read again one host "
++                                              "frame later",
++                                              name));
++        warned = true;
++    }
++
++    // This frame replaces a pending one: it is complete wherever the old one was, and the old one's
++    // damage is still in hostDamage and the stale regions.
++    forgetShmPending();
++    shmState.pending = std::move(pending);
++
++    // The frame is in flight until it reaches the host and its wl_surface.frame is done: no frame
++    // event and no rendering into the swapchain meanwhile.
++    if (!sched.frameInFlight())
++        sched.onFrameSubmitted();
++
++    advanceShm();
++    return true;
++}
++
++void Aquamarine::CWaylandOutput::advanceShm() {
++    if (!shmState.pending)
++        return;
++
++    auto&      P = *shmState.pending;
++    const auto W = (int32_t)shmState.size.x, H = (int32_t)shmState.size.y;
++
++    // the free wl_shm buffer brought up to date most recently (the least to copy), or a new one
++    auto buf = WaylandShm::pickFree(shmState.buffers);
++    if (!buf && shmState.buffers.size() < WaylandShm::MAX_BUFFERS) {
++        buf = createShmBuffer(shmState.size, shmState.format);
++        if (!buf) {
++            dropShmPending(false);
++            return;
++        }
++        shmState.buffers.emplace_back(buf);
++    }
++
++    if (!buf) {
++        // The host holds all our buffers. Neither block nor write into them: the next
++        // wl_buffer.release continues this frame.
++        static bool warned = false;
++        if (!warned)
++            backend->backend->log(AQ_LOG_WARNING, std::format("Output {}: wl_shm: the host holds all {} buffers, the frame waits for a release", name, shmState.buffers.size()));
++        warned = true;
++        return;
++    }
++
++    const auto RECTS = WaylandShm::clippedRects(buf->stale, W, H);
++
++    // The GPU must be done with the frame before the CPU reads it. Its fence is not waited for here:
++    // it goes into the backend's epoll set (one-shot: a signaled sync_file stays readable), and
++    // dispatchShmFDs() calls us again once it signals.
++    if (!RECTS.empty() && P.fence.isValid()) {
++        int fence = waitForSyncFile(P.fence.get(), 0);
++        if (fence == 0) {
++            if (backend->watchShmFD(P.fence.get(), EPOLLIN | EPOLLONESHOT, P.watched)) {
++                P.watched = true;
++                return;
++            }
++
++            // no epoll: wait here, bounded, and never copy a frame whose fence has not signaled
++            fence = waitForSyncFile(P.fence.get(), SHM_FENCE_TIMEOUT_MS);
++            if (fence == 0) {
++                backend->backend->log(AQ_LOG_WARNING, std::format("Output {}: wl_shm: the frame's fence did not signal within {} ms, dropping the frame", name, SHM_FENCE_TIMEOUT_MS));
++                dropShmPending(true);
++                return;
++            }
++        }
++
++        if (P.watched) {
++            backend->unwatchShmFD(P.fence.get());
++            P.watched = false;
++        }
++
++        if (fence < 0) {
++            // only an fd that is not a sync_file gets here: sync_file poll never reports errors
++            backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: wl_shm: cannot poll the frame's fence, treating it as a frame without one", name));
++            P.fence.reset();
++        } else if (P.warned)
++            backend->backend->log(AQ_LOG_WARNING,
++                                  std::format("Output {}: wl_shm: the frame's fence signaled after {} ms", name,
++                                              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - P.since).count()));
++    }
++
++    if (!RECTS.empty() && !copyToShm(P, *buf, RECTS)) {
++        dropShmPending(false);
++        return;
++    }
++
++    // Pixels read without a signaled fence (the frame had none) may predate the frame: read them
++    // again a little later (armShmRecopy), or with the next frame. AQ_WAYLAND_SHM_RECOPY=1 does that
++    // for every frame, =0 never.
++    const int  RECOPY     = backend->shmPresent.recopy;
++    const bool UNVERIFIED = P.frame && !RECTS.empty() && (RECOPY == 1 || (RECOPY == -1 && !P.fence.isValid()));
++    if (UNVERIFIED) {
++        shmState.unverified.add(buf->stale);
++        shmState.unverified.intersect(0, 0, W, H);
++        shmState.unverifiedSource = P.source;
++        shmState.unverifiedAttrs  = P.attrs;
++    }
++
++    buf->stale.clear();
++    buf->syncSeq = ++shmState.seq;
++
++    waylandState.surface->sendAttach(buf->buffer.get(), 0, 0);
++
++    // wl_surface.damage (v1), not damage_buffer (v4). The host advertises wl_compositor v4, so both
++    // exist there, but this surface never changes its buffer scale (1) or transform (normal), so
++    // surface and buffer coordinates are the same, and v1 damage is what every host handles. With
++    // nothing new this is a single pixel, so the host treats it like any other frame.
++    for (const auto& r : WaylandShm::hostDamageRects(shmState.hostDamage)) {
++        waylandState.surface->sendDamage(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1);
++    }
++
++    shmState.hostDamage.clear();
++    buf->busy          = true;
++    shmState.presented = true;
++
++    if (UNVERIFIED)
++        armShmRecopy();
++
++    // As in the dmabuf path: one wl_surface.frame in flight at a time, requested before the commit.
++    // Re-copies request none, the frame cycle they belong to has its own.
++    if (P.frame && !waylandState.frameCallback) {
++        waylandState.frameCallback = makeShared<CCWlCallback>(waylandState.surface->sendFrame());
++        waylandState.frameCallback->setDone([this](CCWlCallback* r, uint32_t ms) { onFrameDone(); });
++        sched.onFrameSubmitted();
++    }
++
++    waylandState.surface->sendCommit();
++    waylandState.surfaceSize = shmState.size;
++
++    forgetShmPending();
++
++    // We may run outside dispatchEvents: flush now, as the dmabuf path does. One sendmsg per frame.
++    wl_display_flush(backend->waylandState.display);
++}
++
++void Aquamarine::CWaylandOutput::forgetShmPending() {
++    if (!shmState.pending)
++        return;
++
++    if (shmState.pending->watched && backend)
++        backend->unwatchShmFD(shmState.pending->fence.get());
++
++    shmState.pending.reset();
++}
++
++void Aquamarine::CWaylandOutput::dropShmPending(bool rerender) {
++    // Gives up on the pending frame. Its damage stays recorded and goes out with the next frame. The
++    // frame in flight it owned ends, so that the consumer renders again on its next scheduleFrame,
++    // or right away with `rerender`.
++    if (!shmState.pending)
++        return;
++
++    const bool FRAME = shmState.pending->frame;
++    forgetShmPending();
++
++    if (FRAME && !waylandState.frameCallback)
++        sched.onFrameComplete();
++
++    if (rerender || (FRAME && needsFrame))
++        scheduleFrame(AQ_SCHEDULE_NEEDS_FRAME);
++}
++
++void Aquamarine::CWaylandOutput::recopyUnverifiedShm() {
++    // Pixels were read without a signaled fence a little while ago; the GPU is done with them by now.
++    // Read them again from the same swapchain buffer, this time after DMA_BUF_IOCTL_SYNC. The
++    // consumer has not rendered into that buffer since: it rotates through its swapchain, and the
++    // first newer frame takes the pixels over (presentShm clears `unverified` then).
++    if (shmState.unverified.empty() || shmState.pending)
++        return;
++
++    auto source = shmState.unverifiedSource;
++    auto attrs  = shmState.unverifiedAttrs;
++    auto region = shmState.unverified.copy();
++    shmState.unverified.clear();
++    shmState.unverifiedSource.reset();
++
++    if (!source || attrs.size != shmState.size || attrs.format != shmState.format)
++        return;
++
++    WaylandShm::addFrameDamage(shmState.buffers, shmState.hostDamage, region);
++    shmState.pending = SShmPending{.source = source, .attrs = attrs, .frame = false, .since = std::chrono::steady_clock::now()};
++    advanceShm();
++}
++
++void Aquamarine::CWaylandOutput::armShmRecopy() {
++    // A timer rather than the next frame callback: that one may have been requested by an earlier
++    // commit and come right away, and asking for a second one in the same commit is something a
++    // simple host may not handle. Without epoll, onFrameDone() re-copies instead.
++    if (!shmState.recopyTimer.isValid() && backend->shmPresent.epollFD.isValid()) {
++        shmState.recopyTimer = Hyprutils::OS::CFileDescriptor{timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)};
++        if (shmState.recopyTimer.isValid() && !backend->watchShmFD(shmState.recopyTimer.get(), EPOLLIN, false))
++            shmState.recopyTimer.reset();
++    }
++
++    if (!shmState.recopyTimer.isValid())
++        return;
++
++    itimerspec when = {.it_interval = {}, .it_value = {.tv_sec = 0, .tv_nsec = SHM_RECOPY_DELAY_MS * 1000000L}};
++    if (timerfd_settime(shmState.recopyTimer.get(), 0, &when, nullptr) != 0)
++        backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: wl_shm: cannot arm the re-copy timer: {}", name, strerror(errno)));
++}
++
++void Aquamarine::CWaylandOutput::onShmRecopyTimer() {
++    if (!shmState.recopyTimer.isValid())
++        return;
++
++    uint64_t expirations = 0;
++    if (read(shmState.recopyTimer.get(), &expirations, sizeof(expirations)) != (ssize_t)sizeof(expirations) || expirations == 0)
++        return; // not due (non-blocking timerfd)
++
++    recopyUnverifiedShm();
++}
++
++void Aquamarine::CWaylandOutput::closeShmRecopyTimer() {
++    if (!shmState.recopyTimer.isValid())
++        return;
++
++    if (backend)
++        backend->unwatchShmFD(shmState.recopyTimer.get());
++
++    shmState.recopyTimer.reset();
++}
++
++void Aquamarine::CWaylandOutput::checkShmFenceAge() {
++    // Runs on host traffic: catches a fence wakeup that went missing, and logs a fence that takes
++    // very long (a GPU that hangs keeps the frame, and the session's output, waiting).
++    if (!shmState.pending || !shmState.pending->watched)
++        return;
++
++    if (waitForSyncFile(shmState.pending->fence.get(), 0) != 0) {
++        advanceShm();
++        return;
++    }
++
++    auto&      P  = *shmState.pending;
++    const auto MS = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - P.since).count();
++    if (P.warned || MS < SHM_FENCE_SLOW_MS)
++        return;
++
++    P.warned = true;
++    backend->backend->log(AQ_LOG_WARNING, std::format("Output {}: wl_shm: the frame's GPU fence has not signaled after {} ms, still waiting", name, MS));
++}
++
++bool Aquamarine::CWaylandOutput::copyToShm(const SShmPending& P, SShmBuffer& dst, const std::vector<pixman_box32_t>& RECTS) {
++    // Read through gbm_bo_map (default: the path verified on the target) or, with
++    // AQ_WAYLAND_SHM_MMAP=1, through a persistent mmap of the dmabuf.
++    const auto SOURCE = backend->shmPresent.mmapSources ? shmSourceFor(P.source, P.attrs) : nullptr;
++    const bool DIRECT = SOURCE && SOURCE->data;
++
++    // DMA_BUF_IOCTL_SYNC around the read. By default: for frames without a fence (START waits for
++    // implicit fences, if the producer attached any), for re-copies, and around reads through the
++    // dmabuf mmap, which the dma-buf uAPI requires for cache coherency (gbm_bo_map does its own).
++    // AQ_WAYLAND_SHM_DMABUF_SYNC=1 always, =0 never.
++    const int  MODE  = backend->shmPresent.dmabufSync;
++    const bool SYNC  = MODE == 1 || (MODE == -1 && (!P.fence.isValid() || !P.frame || DIRECT));
++    const int  FD    = P.attrs.fds.at(0);
++    bool       begun = false;
++    if (SYNC) {
++        begun = syncDmabuf(FD, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
++        if (!begun)
++            TRACE(backend->backend->log(AQ_LOG_TRACE, std::format("Output {}: wl_shm: DMA_BUF_IOCTL_SYNC failed: {}", name, strerror(errno))));
++    }
++
++    const uint8_t* src       = nullptr;
++    size_t         srcStride = 0;
++    bool           gbmMapped = false;
++    if (DIRECT) {
++        src       = SOURCE->data + P.attrs.offsets.at(0);
++        srcStride = P.attrs.strides.at(0);
++    } else if (const auto [ptr, fmt, len] = P.source->beginDataPtr(GBM_BO_TRANSFER_READ); ptr) {
++        src       = ptr;
++        srcStride = len / (size_t)P.attrs.size.y;
++        gbmMapped = true;
++    }
++
++    const bool OK = src && srcStride >= (size_t)P.attrs.size.x * 4;
++    if (OK)
++        WaylandShm::copyRects(dst.data, dst.stride, src, srcStride, RECTS);
++
++    if (gbmMapped)
++        P.source->endDataPtr();
++    if (begun)
++        syncDmabuf(FD, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
++
++    if (!OK)
++        backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: wl_shm: cannot map the rendered buffer for reading", name));
++
++    return OK;
++}
++
++SP<CWaylandOutput::SShmSource> Aquamarine::CWaylandOutput::shmSourceFor(SP<IBuffer> buffer, const SDMABUFAttrs& ATTRS) {
++    // forget buffers that are gone or left the swapchain, so their mappings don't pin GPU memory
++    std::erase_if(shmState.sources, [this, &buffer](const auto& s) {
++        const auto B = s->buffer.lock();
++        return !B || (B != buffer && (!swapchain || !swapchain->contains(B)));
++    });
++
++    for (auto const& s : shmState.sources) {
++        if (s->buffer == buffer)
++            return s;
++    }
++
++    auto source    = makeShared<SShmSource>();
++    source->buffer = buffer;
++    shmState.sources.emplace_back(source);
++
++    // A read-only mapping of the dmabuf itself, kept for the buffer's lifetime (no per-frame map and
++    // unmap). Only for single-plane LINEAR buffers. Otherwise, or if the kernel refuses, data stays
++    // null and copyToShm() reads through gbm_bo_map.
++    if (!backend->shmPresent.mmapSources || ATTRS.planes != 1 || ATTRS.modifier != DRM_FORMAT_MOD_LINEAR)
++        return source;
++
++    const int    FD   = ATTRS.fds.at(0);
++    const size_t NEED = (size_t)ATTRS.offsets.at(0) + (size_t)ATTRS.strides.at(0) * ((size_t)ATTRS.size.y - 1) + (size_t)ATTRS.size.x * 4;
++    const off_t  END  = lseek(FD, 0, SEEK_END); // dmabufs report their size this way
++    lseek(FD, 0, SEEK_SET);
++    const size_t LEN = END > 0 ? (size_t)END : NEED;
++
++    if (LEN < NEED) {
++        backend->backend->log(AQ_LOG_WARNING, std::format("Output {}: wl_shm: dmabuf smaller than its layout ({} < {}), reading it through gbm_bo_map", name, LEN, NEED));
++        return source;
++    }
++
++    void* map = mmap(nullptr, LEN, PROT_READ, MAP_SHARED, FD, 0);
++    if (map == MAP_FAILED) {
++        backend->backend->log(AQ_LOG_WARNING, std::format("Output {}: wl_shm: cannot mmap a rendered buffer ({}), reading it through gbm_bo_map", name, strerror(errno)));
++        return source;
++    }
++
++    source->data = (uint8_t*)map;
++    source->size = LEN;
++    return source;
++}
++
++SP<CWaylandOutput::SShmBuffer> Aquamarine::CWaylandOutput::createShmBuffer(const Vector2D& size, uint32_t format) {
++    const auto   W      = (int32_t)size.x, H = (int32_t)size.y;
++    const auto   STRIDE = W * 4;
++    const size_t LEN    = (size_t)STRIDE * (size_t)H;
++
++    if (LEN > INT32_MAX) {
++        backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: wl_shm: {}x{} is too large for a wl_shm pool", name, W, H));
++        return nullptr;
++    }
++
++    // memfd, sealed against shrinking (which would make the host's reads fault); shm_open as a fallback
++    int fd = memfd_create("aquamarine-wl_shm", MFD_CLOEXEC | MFD_ALLOW_SEALING);
++    if (fd >= 0) {
++        int ret = 0;
++        do {
++            ret = ftruncate(fd, LEN);
++        } while (ret < 0 && errno == EINTR);
++
++        if (ret < 0) {
++            close(fd);
++            fd = -1;
++        } else
++            fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK);
++    }
++
++    if (fd < 0)
++        fd = allocateSHMFile(LEN);
++
++    if (fd < 0) {
++        backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: wl_shm: failed to allocate {} bytes of shared memory", name, LEN));
++        return nullptr;
++    }
++
++    void* data = mmap(nullptr, LEN, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (data == MAP_FAILED) {
++        backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: wl_shm: failed to mmap shared memory: {}", name, strerror(errno)));
++        close(fd);
++        return nullptr;
++    }
++
++    auto buf    = makeShared<SShmBuffer>();
++    buf->data   = (uint8_t*)data;
++    buf->size   = LEN;
++    buf->stride = STRIDE;
++    buf->stale  = CRegion(0, 0, W, H); // holds no frame yet
++
++    // libwayland dups the fd while marshalling, so ours can be closed right away
++    buf->pool = makeShared<CCWlShmPool>(backend->waylandState.shm->sendCreatePool(fd, (int32_t)LEN));
++    close(fd);
++
++    if (!buf->pool->resource()) {
++        backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: wl_shm: failed to create a pool", name));
++        return nullptr;
++    }
++
++    buf->buffer = makeShared<CCWlBuffer>(buf->pool->sendCreateBuffer(0, W, H, STRIDE, shmFormatFromDRM(format)));
++
++    if (!buf->buffer->resource()) {
++        backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: wl_shm: failed to create a buffer", name));
++        return nullptr;
++    }
++
++    buf->buffer->setRelease([this, raw = buf.get()](CCWlBuffer* r) {
++        raw->busy = false;
++        advanceShm(); // a frame may be waiting for a free buffer
++    });
++
++    backend->backend->log(AQ_LOG_DEBUG,
++                          std::format("Output {}: wl_shm: new {}x{} {} buffer ({} of at most {})", name, W, H, fourccToName(format), shmState.buffers.size() + 1,
++                                      WaylandShm::MAX_BUFFERS));
++    return buf;
++}
+diff --git a/src/backend/WaylandShm.hpp b/src/backend/WaylandShm.hpp
+new file mode 100644
+index 0000000..775fd83
+--- /dev/null
++++ b/src/backend/WaylandShm.hpp
+@@ -0,0 +1,96 @@
++#pragma once
++
++// CPU-side helpers for the Wayland backend's wl_shm presentation path (see
++// CWaylandOutput::presentShm in Wayland.cpp). Nothing in here talks to Wayland
++// or the GPU, so a test can drive it with plain memory.
++//
++// Bookkeeping used by presentShm, per output:
++//  - every wl_shm buffer has a `stale` region: pixels that are older than the
++//    newest frame. A new buffer is entirely stale. Presenting into a buffer
++//    copies only its stale rectangles from the rendered frame, after which the
++//    buffer equals the frame.
++//  - `hostDamage` holds every pixel that changed since the host last copied
++//    from us. It is sent as wl_surface.damage and then cleared. Each buffer's
++//    stale region always contains hostDamage, so the attached buffer is
++//    correct wherever the host looks.
++//  - pixels read without a signaled GPU fence are "unverified": they are added
++//    to the stale regions and hostDamage again one host frame later and read
++//    again from the same rendered buffer (or from the next frame, if it comes
++//    first).
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++#include <hyprutils/math/Region.hpp>
++
++namespace Aquamarine::WaylandShm {
++    // wl_shm buffers per output. The host normally returns a buffer right after copying it, so
++    // one is in use and a second one covers a late release. If all of them are held, the frame
++    // waits for a release rather than overwriting memory the host may still read.
++    constexpr size_t MAX_BUFFERS = 3;
++
++    // Above this many rectangles, damage the host with the bounding box instead. This is always
++    // correct: the attached buffer is complete, so extra damage only makes the host copy more.
++    constexpr size_t MAX_DAMAGE_RECTS = 32;
++
++    // `region` clipped to a w x h buffer, as rectangles in buffer pixels.
++    inline std::vector<pixman_box32_t> clippedRects(const Hyprutils::Math::CRegion& region, int32_t w, int32_t h) {
++        auto clipped = region.copy();
++        clipped.intersect(0, 0, w, h);
++        return clipped.getRects();
++    }
++
++    // Copies `rects` of a 32 bpp image from src to dst. Both have their origin top-left; strides
++    // are in bytes. Each rect must lie inside both images. Returns the number of bytes copied.
++    inline size_t copyRects(uint8_t* dst, size_t dstStride, const uint8_t* src, size_t srcStride, const std::vector<pixman_box32_t>& rects) {
++        size_t copied = 0;
++        for (const auto& r : rects) {
++            if (r.x2 <= r.x1 || r.y2 <= r.y1)
++                continue;
++
++            const size_t X   = (size_t)r.x1 * 4;
++            const size_t LEN = (size_t)(r.x2 - r.x1) * 4;
++            for (int32_t y = r.y1; y < r.y2; ++y) {
++                memcpy(dst + (size_t)y * dstStride + X, src + (size_t)y * srcStride + X, LEN);
++            }
++            copied += LEN * (size_t)(r.y2 - r.y1);
++        }
++        return copied;
++    }
++
++    // A new frame changed `damage` (buffer pixels, already clipped). This makes those pixels stale
++    // in every buffer, including ones the host still holds, and pending for the host.
++    template <typename BUFFERS>
++    void addFrameDamage(BUFFERS& buffers, Hyprutils::Math::CRegion& hostDamage, const Hyprutils::Math::CRegion& damage) {
++        for (auto& b : buffers) {
++            b->stale.add(damage);
++        }
++        hostDamage.add(damage);
++    }
++
++    // Picks a buffer to present into: among those the host has released, the one brought up to
++    // date most recently, which has the least to copy. Returns an empty value if the host holds
++    // all of them.
++    template <typename BUFFERS>
++    typename BUFFERS::value_type pickFree(BUFFERS& buffers) {
++        typename BUFFERS::value_type best{};
++        for (auto& b : buffers) {
++            if (!b->busy && (!best || b->syncSeq > best->syncSeq))
++                best = b;
++        }
++        return best;
++    }
++
++    // The rectangles to send as wl_surface.damage for `region`. An empty region (a commit that only
++    // keeps the frame loop going, re-attaching an up-to-date buffer) still gets one pixel, so that
++    // the host handles it like any other frame. That pixel is current in the attached buffer.
++    inline std::vector<pixman_box32_t> hostDamageRects(const Hyprutils::Math::CRegion& region) {
++        auto rects = region.getRects();
++        if (rects.empty())
++            return {pixman_box32_t{.x1 = 0, .y1 = 0, .x2 = 1, .y2 = 1}};
++        if (rects.size() <= MAX_DAMAGE_RECTS)
++            return rects;
++        return {*pixman_region32_extents(region.pixman())};
++    }
++}
